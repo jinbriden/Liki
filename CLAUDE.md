@@ -1,0 +1,62 @@
+# Liki 即时通讯项目
+
+Web 端即时通讯软件，个人学习项目（Go 后端 + React 前端 + PostgreSQL）。
+完整需求、架构、数据模型和里程碑见：@docs/requirements.md
+
+## 目录结构
+
+- `docker-compose.yml`：本地 PostgreSQL，监听 127.0.0.1:5432，用户 / 密码 / 库名 = im / im123 / im
+- `im-server/`：Go 后端，模块名 `im-server`
+  - `cmd/server/main.go`：程序入口，在这里手动组装依赖（repository → service → handler）
+  - `internal/<模块>/`：user、friend、message、gateway，每个模块按 `model.go`、`repository.go`、`service.go`、`handler.go` 分层
+  - `internal/pkg/response/`：统一响应格式 `{code, msg, data}` 和错误码常量（常量名以代码为准）
+  - `internal/pkg/auth/`：JWT 签发/校验（`JWTManager`，不依赖 gin，WS 网关可复用）和鉴权中间件；handler 用 `auth.UserID(c)` 取当前用户
+  - `migrations/`：golang-migrate 的 SQL 迁移文件
+- 前端 `web/`：尚未创建
+
+## 代码约定
+
+- handler 只负责 JSON 绑定和写响应；service 写业务逻辑；repository 只访问数据库。
+- 参数校验：handler 不写 `binding` 校验规则，业务规则（长度、字符集等）在 service 校验并返回哨兵错误（如 `ErrInvalidPassword`）。请求体无法解析 → `CodeBadRequest`(10002)；业务规则不满足 → `CodeInvalidParam`(10001)。
+- 数据库错误（如唯一约束冲突）在 repository 层翻译成业务哨兵错误，service 和 handler 不 import gorm。
+- GORM 已开启 `TranslateError: true`。
+- 接口返回专门定义的 resp 结构体，不直接返回 model，避免泄露 `password_hash` 等字段。
+- 表结构变更只通过 `migrations/` 下的迁移文件，不使用 GORM AutoMigrate，不手动改表。
+- 服务开发阶段只监听 `127.0.0.1:8080`。
+- 需要登录的接口注册到 `RegisterRoutes(public, protected)` 的 protected 分组；当前用户 ID 一律取 `auth.UserID(c)`，不信任请求里的用户 ID。
+- 401 分两种错误码：`CodeUnauthorized`(10003) 表示令牌缺失/无效/过期，前端应跳转登录；`CodeInvalidCredentials`(20001) 表示登录失败，前端不跳转。
+- 日志里不能出现密码和令牌。
+
+## 常用命令
+
+```bash
+# 在仓库根目录
+docker compose up -d
+
+# 在 im-server 目录
+migrate -path migrations -database "postgres://im:im123@localhost:5432/im?sslmode=disable" up
+# JWT_SECRET 必填（至少 32 字节），没有默认值，缺失时服务拒绝启动。
+# 生成一次后固定使用（例如写进 ~/.bashrc），每次换密钥会让已签发的令牌全部失效：
+#   openssl rand -base64 48
+export JWT_SECRET='<你的密钥>'
+go run ./cmd/server
+# WSL 里有 http_proxy 时，curl 测本地接口要加 --noproxy '*'
+go build ./...
+go test ./...
+```
+
+## 当前进度
+
+- M1 项目骨架：已完成（健康检查 `GET /health`）。
+- M2 账号：后端已完成。
+  - `POST /api/v1/auth/register`：用户名不唯一、兼作昵称（迁移 000004 删除了 nickname 列）；用户 ID 是 `crypto/rand` 生成的随机 10 位数，主键冲突时重试（迁移 000003）。
+  - `POST /api/v1/auth/login`：用户 ID + 密码，签发 HS256 JWT，有效期 3 天。用户不存在时也做一次假 bcrypt 比较，使响应时间与密码错误一致。
+  - `GET /api/v1/me`：受保护接口，未登录返回 401（M2 完成标准）。
+  - 退出登录（FR-03）由前端删除令牌并断开长连接，服务端不提供 logout 接口。
+  - 下一步：M3 好友模块；或者先补 repository 集成测试（单独的 `im_test` 库）。
+- 待办：登录、注册限流（NFR-05，M6）；WebSocket 携带令牌的方式（M4 决定，避免把令牌放进 URL 参数，否则会被写进访问日志）。
+
+## 协作方式
+
+- 这是我用来学习 Go 的项目：优先帮我解释代码、排查报错、审查我写的代码；核心逻辑由我自己写。修改代码前先说明方案，等我确认。
+- 用中文交流。我熟悉 Java，讲解时可以类比 Java / Spring。
