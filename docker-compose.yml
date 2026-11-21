@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: im-postgres
+    environment:
+      POSTGRES_USER: im
+      POSTGRES_PASSWORD: im123
+      POSTGRES_DB: im
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
