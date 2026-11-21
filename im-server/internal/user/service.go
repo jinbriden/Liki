@@ -1,0 +1,193 @@
+package user
+
+import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"math/big"
+	"sync"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
+)
+
+// 用户名、密码规则。只允许 ASCII 字符，所以 len（字节数）等于字符数。
+// 密码最长 24 位，远低于 bcrypt 的 72 字节上限。
+const (
+	minUsernameLen = 3
+	maxUsernameLen = 32
+	minPasswordLen = 8
+	maxPasswordLen = 24
+)
+
+// 用户 ID 是 [minUserID, maxUserID] 范围内的随机 10 位数
+const (
+	minUserID     = 1_000_000_000
+	maxUserID     = 9_999_999_999
+	maxIDAttempts = 5 // 生成的 ID 与已有账号冲突时的最大尝试次数
+)
+
+// IDGenerator 生成新用户 ID。抽成函数类型，测试时可以注入固定的 ID 序列。
+type IDGenerator func() (int64, error)
+
+// RandomUserID 用 crypto/rand 生成随机 10 位 ID。
+// 使用加密安全的随机源，ID 不可预测，无法按顺序猜出其他账号或推算注册量。
+func RandomUserID() (int64, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(maxUserID-minUserID+1))
+	if err != nil {
+		return 0, err
+	}
+	return minUserID + n.Int64(), nil
+}
+
+// TokenIssuer 签发访问令牌。service 只依赖这个接口，不依赖具体的 JWT 实现。
+type TokenIssuer interface {
+	Issue(userID int64) (token string, expiresAt time.Time, err error)
+}
+
+type Service struct {
+	repo   Repository
+	tokens TokenIssuer
+	newID  IDGenerator
+}
+
+func NewService(repo Repository, tokens TokenIssuer, newID IDGenerator) *Service {
+	return &Service{repo: repo, tokens: tokens, newID: newID}
+}
+
+// Register 注册新用户。用户名允许重复，按用户输入原样保存；账号由随机生成的 ID 唯一标识。
+func (s *Service) Register(ctx context.Context, username, password string) (*User, error) {
+	if err := validateUsername(username); err != nil {
+		return nil, err
+	}
+	if err := validatePassword(password); err != nil {
+		return nil, err
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("hash password: %w", err)
+	}
+
+	u := &User{Username: username, PasswordHash: string(hash)}
+	// 随机 ID 有极小概率和已有账号相同，此时主键约束会拒绝插入，换一个 ID 重试
+	for range maxIDAttempts {
+		if u.ID, err = s.newID(); err != nil {
+			return nil, fmt.Errorf("generate user id: %w", err)
+		}
+		err = s.repo.Create(ctx, u)
+		if errors.Is(err, ErrDuplicateID) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return u, nil
+	}
+	return nil, fmt.Errorf("allocate user id: still conflicting after %d attempts", maxIDAttempts)
+}
+
+// LoginResult 登录成功后返回的数据
+type LoginResult struct {
+	User      *User
+	Token     string
+	ExpiresAt time.Time
+}
+
+// dummyHash 用于"用户不存在"时也做一次 bcrypt 比较，使响应时间和"密码错误"一致，
+// 防止通过响应快慢判断某个 ID 是否存在。cost 必须和真实密码哈希相同，耗时才一致。
+// sync.OnceValue 保证只在第一次用到时计算一次（类似 Java 的懒加载单例）。
+var dummyHash = sync.OnceValue(func() []byte {
+	h, err := bcrypt.GenerateFromPassword([]byte("liki-dummy-password"), bcrypt.DefaultCost)
+	if err != nil {
+		panic(fmt.Sprintf("generate dummy hash: %v", err))
+	}
+	return h
+})
+
+// Login 用户 ID + 密码登录，成功后签发令牌。
+// 用户不存在、密码错误、参数明显不合法，都返回同一个 ErrInvalidCredentials。
+func (s *Service) Login(ctx context.Context, userID int64, password string) (*LoginResult, error) {
+	// 只做"不可能正确"的快速拒绝，不校验密码复杂度：以后调整注册规则时，老用户仍要能登录
+	if userID < minUserID || userID > maxUserID || password == "" || len(password) > maxPasswordLen {
+		return nil, ErrInvalidCredentials
+	}
+
+	u, err := s.repo.FindByID(ctx, userID)
+	if errors.Is(err, ErrUserNotFound) {
+		_ = bcrypt.CompareHashAndPassword(dummyHash(), []byte(password))
+		return nil, ErrInvalidCredentials
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	err = bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password))
+	if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+		return nil, ErrInvalidCredentials
+	}
+	if err != nil {
+		// 库里的哈希格式损坏等异常情况，属于服务端问题，不能当成"密码错误"掩盖掉
+		return nil, fmt.Errorf("compare password: %w", err)
+	}
+
+	token, expiresAt, err := s.tokens.Issue(u.ID)
+	if err != nil {
+		return nil, fmt.Errorf("issue token: %w", err)
+	}
+	return &LoginResult{User: u, Token: token, ExpiresAt: expiresAt}, nil
+}
+
+// GetByID 查询用户，不存在时返回 ErrUserNotFound。
+func (s *Service) GetByID(ctx context.Context, userID int64) (*User, error) {
+	return s.repo.FindByID(ctx, userID)
+}
+
+// validateUsername 用户名：3-32 位，只能是英文字母或数字。
+func validateUsername(username string) error {
+	if len(username) < minUsernameLen || len(username) > maxUsernameLen {
+		return ErrInvalidUsername
+	}
+	// 按字节遍历：中文等非 ASCII 字符的每个字节都 >= 0x80，会落到不合法分支
+	for i := 0; i < len(username); i++ {
+		c := username[i]
+		if !isUpper(c) && !isLower(c) && !isDigit(c) {
+			return ErrInvalidUsername
+		}
+	}
+	return nil
+}
+
+// validatePassword 密码：8-24 位，只能使用可打印 ASCII 字符（不含空格），
+// 并且至少包含一个大写字母、一个小写字母和一个数字。
+func validatePassword(password string) error {
+	if len(password) < minPasswordLen || len(password) > maxPasswordLen {
+		return ErrInvalidPassword
+	}
+	var hasUpper, hasLower, hasDigit bool
+	for i := 0; i < len(password); i++ {
+		c := password[i]
+		switch {
+		case isUpper(c):
+			hasUpper = true
+		case isLower(c):
+			hasLower = true
+		case isDigit(c):
+			hasDigit = true
+		case c >= '!' && c <= '~':
+			// 其余可打印 ASCII 符号（0x21-0x7E），允许但不计入任何一类
+		default:
+			// 空格、控制字符、非 ASCII 字符（中文、emoji 等）
+			return ErrInvalidPassword
+		}
+	}
+	if !hasUpper || !hasLower || !hasDigit {
+		return ErrInvalidPassword
+	}
+	return nil
+}
+
+func isUpper(c byte) bool { return c >= 'A' && c <= 'Z' }
+func isLower(c byte) bool { return c >= 'a' && c <= 'z' }
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
