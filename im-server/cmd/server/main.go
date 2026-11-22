@@ -20,6 +20,7 @@ import (
 	"im-server/internal/message"
 	"im-server/internal/pkg/auth"
 	"im-server/internal/pkg/logger"
+	"im-server/internal/pkg/reqctx"
 	"im-server/internal/user"
 )
 
@@ -74,8 +75,9 @@ func run() error {
 	}
 
 	r := gin.New()
-	// 顺序：日志中间件在最外层（生成 request_id，最后记录访问日志），Recovery 在里面（panic 也能被访问日志记到 500）
-	r.Use(logger.Middleware(), logger.Recovery())
+	// 顺序：日志中间件在最外层（生成 request_id，最后记录访问日志），Recovery 在里面（panic 也能被访问日志记到 500）；
+	// reqctx 让写请求不因客户端断开而中途取消（避免"数据库已提交、接口却返回 500、推送被跳过"）
+	r.Use(logger.Middleware(), logger.Recovery(), reqctx.Middleware())
 	r.GET("/health", func(c *gin.Context) {
 		sqlDB, err := db.DB()
 		if err != nil || sqlDB.PingContext(c.Request.Context()) != nil {

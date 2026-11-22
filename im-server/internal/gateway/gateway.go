@@ -16,6 +16,7 @@ import (
 
 	"im-server/internal/pkg/auth"
 	"im-server/internal/pkg/logger"
+	"im-server/internal/pkg/reqctx"
 	"im-server/internal/pkg/response"
 )
 
@@ -239,6 +240,11 @@ func (g *Gateway) dispatch(c *conn, raw []byte) {
 	}
 
 	slog.DebugContext(ctx, "ws packet received", "type", p.Type)
+	// 处理函数用脱离连接的 ctx（保留 conn_id、user_id 日志字段）：连接在处理途中被关闭（写失败、服务端关闭）时，
+	// 已经开始的写操作照样完成并推送给其他人，不会出现"消息已写库、却因为 ctx 取消而报错、推送被跳过"。
+	// 回复本身不受影响：Reply 按连接自己的状态判断能不能发
+	hctx, cancel := reqctx.Detach(ctx)
+	defer cancel()
 	defer func() {
 		// 某个处理函数 panic 不能拖垮整个连接（更不能拖垮进程），和 HTTP 的 Recovery 中间件同理
 		if r := recover(); r != nil {
@@ -246,7 +252,7 @@ func (g *Gateway) dispatch(c *conn, raw []byte) {
 			c.replyError(ctx, codeInternal, "服务器内部错误", p.Type)
 		}
 	}()
-	h(ctx, c, p.Data)
+	h(hctx, c, p.Data)
 }
 
 // encode 把 type 和 data 包装成统一格式的数据包
