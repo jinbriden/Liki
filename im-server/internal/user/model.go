@@ -23,5 +23,15 @@ type User struct {
 	Username     string
 	PasswordHash string
 	AvatarURL    string `gorm:"column:avatar_url"`
-	CreatedAt    time.Time
+	// CreatedAt 由数据库 now() 生成（精度微秒），插入时通过 RETURNING 取回，
+	// 保证返回给调用方的值和库里存的完全一致。关闭 GORM 默认的"用 Go time.Now() 填充"。
+	CreatedAt time.Time `gorm:"autoCreateTime:false;default:now()"`
+}
+
+// Profile 对其他模块公开的用户资料，不含 PasswordHash 等敏感字段。
+// 好友、消息等模块只通过它拿用户信息，不直接查 users 表。
+type Profile struct {
+	ID        int64
+	Username  string
+	AvatarURL string
 }

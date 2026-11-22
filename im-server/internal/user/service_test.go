@@ -3,6 +3,7 @@ package user
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -224,5 +225,93 @@ func TestService_GetByID(t *testing.T) {
 	}
 	if _, err := svc.GetByID(ctx, 9999999999); !errors.Is(err, ErrUserNotFound) {
 		t.Errorf("err = %v, want ErrUserNotFound", err)
+	}
+}
+
+func TestParseUserID(t *testing.T) {
+	tests := []struct {
+		in   string
+		want int64
+	}{
+		{"1234567890", 1234567890},
+		{"9999999999", 9999999999},
+		{"0123456789", 0},  // 以 0 开头，不在合法 ID 范围内
+		{"123456789", 0},   // 9 位
+		{"12345678901", 0}, // 11 位
+		{"+123456789", 0},  // strconv.ParseInt 能解析，但不是纯数字
+		{"12345abcde", 0},
+		{"", 0},
+	}
+	for _, tt := range tests {
+		if got := parseUserID(tt.in); got != tt.want {
+			t.Errorf("parseUserID(%q) = %d, want %d", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestService_SearchProfiles(t *testing.T) {
+	svc, _ := newTestService()
+	register := func(name string) int64 {
+		t.Helper()
+		u, err := svc.Register(context.Background(), name, validPassword)
+		if err != nil {
+			t.Fatalf("Register(%q): %v", name, err)
+		}
+		return u.ID
+	}
+	sam1 := register("Sam")
+	sam2 := register("sam")
+	_ = register("Samuel")
+	// counterIDs 生成的第 4 个 ID 是 1000000004；再注册一个用户名恰好是这串数字的人
+	digitID := register("1000000004")
+	if digitID != 1000000004 {
+		t.Fatalf("测试前提不成立：digitID = %d", digitID)
+	}
+	numericName := register("1000000001") // 用户名和 sam1 的 ID 相同
+
+	tests := []struct {
+		name    string
+		keyword string
+		limit   int
+		want    []int64
+	}{
+		{name: "用户名不区分大小写、完全匹配", keyword: "SAM", limit: 20, want: []int64{sam1, sam2}},
+		{name: "首尾空白", keyword: "  sam ", limit: 20, want: []int64{sam1, sam2}},
+		{name: "ID 和纯数字用户名都命中，ID 命中的在前", keyword: "1000000001", limit: 20, want: []int64{sam1, numericName}},
+		{name: "同一个人 ID 和用户名都命中，只出现一次", keyword: "1000000004", limit: 20, want: []int64{digitID}},
+		{name: "limit 截断", keyword: "sam", limit: 1, want: []int64{sam1}},
+		{name: "没有匹配", keyword: "nobody", limit: 20, want: nil},
+		{name: "空关键字", keyword: "   ", limit: 20, want: nil},
+		{name: "超长关键字", keyword: strings.Repeat("a", 33), limit: 20, want: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			profiles, err := svc.SearchProfiles(context.Background(), tt.keyword, tt.limit)
+			if err != nil {
+				t.Fatalf("SearchProfiles: %v", err)
+			}
+			var got []int64
+			for _, p := range profiles {
+				got = append(got, p.ID)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestService_GetProfiles(t *testing.T) {
+	svc, _ := newTestService()
+	u, err := svc.Register(context.Background(), validUsername, validPassword)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	profiles, err := svc.GetProfiles(context.Background(), []int64{u.ID, 1999999999})
+	if err != nil {
+		t.Fatalf("GetProfiles: %v", err)
+	}
+	if len(profiles) != 1 || profiles[0].ID != u.ID || profiles[0].Username != validUsername {
+		t.Errorf("profiles = %+v, want 只有 %d", profiles, u.ID)
 	}
 }

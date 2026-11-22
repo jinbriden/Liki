@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +165,45 @@ func TestHandler_LoginThenMe(t *testing.T) {
 	_, _, me := decode[userResp](t, w)
 	if me.ID != reg.ID || me.Username != "Alice" {
 		t.Errorf("/me = %+v, want id=%d", me, reg.ID)
+	}
+	// 注册返回的 createdAt 必须和之后查询到的完全一致（精度、时区都相同）
+	if !me.CreatedAt.Equal(reg.CreatedAt) {
+		t.Errorf("createdAt 不一致: 注册=%s, /me=%s", reg.CreatedAt, me.CreatedAt)
+	}
+}
+
+// 接口里的时间统一以 UTC 输出（RFC 3339 末尾为 Z），不受服务器时区影响
+func TestHandler_TimesAreUTC(t *testing.T) {
+	r := newTestRouter(t)
+	w := postJSON(r, "/api/v1/auth/register", `{"username":"Alice","password":"Passw0rd"}`)
+	_, _, reg := decode[userResp](t, w)
+	assertUTCField(t, w.Body.String(), "createdAt")
+
+	w = postJSON(r, "/api/v1/auth/login", fmt.Sprintf(`{"userId":%d,"password":"Passw0rd"}`, reg.ID))
+	assertUTCField(t, w.Body.String(), "expiresAt")
+	assertUTCField(t, w.Body.String(), "createdAt")
+	_, _, login := decode[loginResp](t, w)
+
+	w = doRequest(r, http.MethodGet, "/api/v1/me", "", login.Token)
+	assertUTCField(t, w.Body.String(), "createdAt")
+}
+
+var timeFieldRe = regexp.MustCompile(`"(createdAt|expiresAt)":"([^"]*)"`)
+
+func assertUTCField(t *testing.T, body, field string) {
+	t.Helper()
+	found := false
+	for _, m := range timeFieldRe.FindAllStringSubmatch(body, -1) {
+		if m[1] != field {
+			continue
+		}
+		found = true
+		if !strings.HasSuffix(m[2], "Z") {
+			t.Errorf("%s = %q，应以 Z 结尾（UTC）", field, m[2])
+		}
+	}
+	if !found {
+		t.Errorf("响应中没有 %s 字段: %s", field, body)
 	}
 }
 

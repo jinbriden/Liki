@@ -52,8 +52,9 @@ type loginResp struct {
 	User      userResp  `json:"user"`
 }
 
+// toUserResp 时间统一转成 UTC 输出（形如 2026-11-21T13:33:39.400657Z），不受服务器所在时区影响
 func toUserResp(u *User) userResp {
-	return userResp{ID: u.ID, Username: u.Username, CreatedAt: u.CreatedAt}
+	return userResp{ID: u.ID, Username: u.Username, CreatedAt: u.CreatedAt.UTC()}
 }
 
 const (
@@ -111,7 +112,7 @@ func (h *Handler) login(c *gin.Context) {
 
 	response.OK(c, loginResp{
 		Token:     res.Token,
-		ExpiresAt: res.ExpiresAt,
+		ExpiresAt: res.ExpiresAt.UTC(),
 		User:      toUserResp(res.User),
 	})
 }

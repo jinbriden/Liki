@@ -10,6 +10,7 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
+	"im-server/internal/friend"
 	"im-server/internal/pkg/auth"
 	"im-server/internal/user"
 )
@@ -51,9 +52,14 @@ func main() {
 	userSvc := user.NewService(userRepo, jwtMgr, user.RandomUserID)
 	userHandler := user.NewHandler(userSvc)
 
+	friendRepo := friend.NewRepository(db)
+	friendSvc := friend.NewService(friendRepo, userSvc) // *user.Service 满足 friend.UserDirectory 接口
+	friendHandler := friend.NewHandler(friendSvc)
+
 	api := r.Group("/api/v1")                           // 公开接口
 	protected := api.Group("", auth.Middleware(jwtMgr)) // 需要登录的接口
 	userHandler.RegisterRoutes(api, protected)
+	friendHandler.RegisterRoutes(api, protected)
 
 	if err := r.Run("127.0.0.1:8080"); err != nil {
 		slog.Error("服务启动失败", "err", err)

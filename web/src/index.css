@@ -1,0 +1,332 @@
+/* 配色变量，与 src/theme.ts 的 palette 保持一致 */
+:root {
+  --liki-bg: #0e0e10;
+  --liki-panel: #151517;
+  --liki-hover: #1c1c20;
+  --liki-active: #25252a;
+  --liki-border: #26262b;
+  --liki-text: #e8e8ea;
+  --liki-text-2: #8b8b93;
+  --liki-text-3: #5f5f67;
+  --liki-primary: #4f7cff;
+
+  color-scheme: dark; /* 滚动条、原生控件也用暗色 */
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--liki-bg);
+  color: var(--liki-text);
+}
+
+/* ---------- 主框架：左侧导航 + 内容区 ---------- */
+
+.app-shell {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app-nav {
+  width: 64px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 0;
+  background: var(--liki-panel);
+  border-right: 1px solid var(--liki-border);
+}
+
+.app-logo {
+  width: 36px;
+  height: 36px;
+  margin-bottom: 12px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--liki-active);
+  color: var(--liki-text);
+  font-weight: 600;
+  font-size: 18px;
+}
+
+.app-nav-item {
+  width: 44px;
+  height: 44px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--liki-text-2);
+  font-size: 20px;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+
+.app-nav-item:hover {
+  background: var(--liki-hover);
+  color: var(--liki-text);
+}
+
+.app-nav-item.active {
+  background: var(--liki-active);
+  color: var(--liki-text);
+}
+
+.app-nav-spacer {
+  flex: 1;
+}
+
+.app-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
+/* ---------- 列表栏 + 详情区 ---------- */
+
+.list-pane {
+  width: 300px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--liki-panel);
+  border-right: 1px solid var(--liki-border);
+}
+
+.list-pane-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 16px 12px 12px 16px;
+}
+
+.list-pane-title {
+  flex: 1;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.list-pane-filter {
+  padding: 0 12px 12px;
+}
+
+.list-pane-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 8px 8px;
+}
+
+.list-section-title {
+  padding: 14px 10px 6px;
+  font-size: 12px;
+  color: var(--liki-text-3);
+}
+
+.list-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  color: var(--liki-text);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.list-item:hover {
+  background: var(--liki-hover);
+  color: var(--liki-text);
+}
+
+.list-item.active {
+  background: var(--liki-active);
+}
+
+.list-item-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.list-item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list-item-sub {
+  font-size: 12px;
+  color: var(--liki-text-2);
+}
+
+.icon-tile {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--liki-active);
+  color: var(--liki-text-2);
+  font-size: 18px;
+}
+
+.detail-pane {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  background: var(--liki-bg);
+}
+
+.placeholder {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--liki-text-3);
+}
+
+.placeholder-icon {
+  font-size: 48px;
+}
+
+/* ---------- 好友详情 ---------- */
+
+.profile {
+  max-width: 420px;
+  margin: 0 auto;
+  padding: 72px 24px 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.profile-avatar {
+  cursor: pointer;
+  border-radius: 50%;
+}
+
+.profile-name {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  word-break: break-all;
+  text-align: center;
+}
+
+.profile-meta {
+  width: 100%;
+  padding: 12px 16px;
+  border: 1px solid var(--liki-border);
+  border-radius: 8px;
+  background: var(--liki-panel);
+}
+
+.profile-meta-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 0;
+  color: var(--liki-text-2);
+}
+
+.profile-meta-row > :last-child {
+  color: var(--liki-text);
+}
+
+/* ---------- 申请列表 / 搜索结果 ---------- */
+
+.requests {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.requests-title {
+  margin: 0 0 8px;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.card-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  margin-bottom: 8px;
+  border: 1px solid var(--liki-border);
+  border-radius: 8px;
+  background: var(--liki-panel);
+}
+
+.card-item-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.card-item-name {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  word-break: break-all;
+}
+
+.card-item-id {
+  font-size: 12px;
+  color: var(--liki-text-2);
+  white-space: nowrap;
+}
+
+.card-item-message {
+  margin-top: 4px;
+  color: var(--liki-text-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.card-item-time {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--liki-text-3);
+}
+
+.card-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.search-results {
+  margin-top: 16px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.compose {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* TextArea 的字数统计（showCount）绝对定位在输入框下方，按钮要让出位置 */
+.compose-actions {
+  margin-top: 18px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

@@ -12,7 +12,11 @@ Web 端即时通讯软件，个人学习项目（Go 后端 + React 前端 + Post
   - `internal/pkg/response/`：统一响应格式 `{code, msg, data}` 和错误码常量（常量名以代码为准）
   - `internal/pkg/auth/`：JWT 签发/校验（`JWTManager`，不依赖 gin，WS 网关可复用）和鉴权中间件；handler 用 `auth.UserID(c)` 取当前用户
   - `migrations/`：golang-migrate 的 SQL 迁移文件
-- 前端 `web/`：尚未创建
+- `web/`：React + TS + Vite 前端（antd 6、React Router 8、Zustand 5），结构见 `web/README.md`
+  - Node 用 WSL 内 nvm 安装的版本（不要用 PATH 里 Windows 的 npm）
+  - 开发时 Vite 把 `/api` 代理到 8080，后端不配 CORS
+  - 令牌存 localStorage（键 `liki.token`），只通过 `src/stores/auth.ts` 读写；api 层遇到 10003 只清登录状态，由路由守卫负责跳转
+  - UI 风格：黑色系为主，克制扁平；不要赛博朋克元素（霓虹色、发光阴影、渐变、扫描线等）。强调色 `#4f7cff` 只用于主按钮、角标、链接。配色改 `src/theme.ts`，并同步 `src/index.css` 的 `--liki-*` 变量
 
 ## 代码约定
 
@@ -26,6 +30,8 @@ Web 端即时通讯软件，个人学习项目（Go 后端 + React 前端 + Post
 - 需要登录的接口注册到 `RegisterRoutes(public, protected)` 的 protected 分组；当前用户 ID 一律取 `auth.UserID(c)`，不信任请求里的用户 ID。
 - 401 分两种错误码：`CodeUnauthorized`(10003) 表示令牌缺失/无效/过期，前端应跳转登录；`CodeInvalidCredentials`(20001) 表示登录失败，前端不跳转。
 - 日志里不能出现密码和令牌。
+- 时间字段（如 `created_at`）由数据库 `now()` 生成：model 上用 `gorm:"autoCreateTime:false;default:now()"`，GORM 插入时通过 `RETURNING` 取回，保证返回值和库里一致（微秒精度）。不要用 Go 的 `time.Now()` 写入。
+- 接口输出的时间一律转成 UTC（`.UTC()`，JSON 形如 `...Z`）。
 
 ## 常用命令
 
@@ -43,6 +49,11 @@ go run ./cmd/server
 # WSL 里有 http_proxy 时，curl 测本地接口要加 --noproxy '*'
 go build ./...
 go test ./...
+
+# 在 web 目录（需先启动后端）
+npm run dev     # http://127.0.0.1:5173
+npm run build   # 类型检查 + 打包
+npm run lint
 ```
 
 ## 当前进度
@@ -53,7 +64,13 @@ go test ./...
   - `POST /api/v1/auth/login`：用户 ID + 密码，签发 HS256 JWT，有效期 3 天。用户不存在时也做一次假 bcrypt 比较，使响应时间与密码错误一致。
   - `GET /api/v1/me`：受保护接口，未登录返回 401（M2 完成标准）。
   - 退出登录（FR-03）由前端删除令牌并断开长连接，服务端不提供 logout 接口。
-  - 下一步：M3 好友模块；或者先补 repository 集成测试（单独的 `im_test` 库）。
+  - 前端已完成：登录页、注册页（注册成功后自动登录，主框架弹窗提示记住用户 ID）；退出登录在左侧导航底部的账号菜单里。
+- M3 好友：后端已完成（迁移 000005、`internal/friend/`、错误码 3xxxx），service 单元测试覆盖申请/处理/删除/搜索；已用真实库走通"互加好友再删除"。
+  - 接口：`GET /friends/search?q=`、`GET /friends`、`DELETE /friends/:friendId`、`POST /friend-requests`、`GET /friend-requests/incoming|outgoing`、`POST /friend-requests/:id/accept|reject`（都在 `/api/v1` 下，需登录）；列表统一返回 `{items: [...]}`。
+  - 两人之间最多一条待处理申请，由唯一索引 `uq_friend_requests_pending_pair` 兜底；repository 命中时返回 `ErrPendingExists`，service 判断方向（同方向幂等返回，反方向 30003）。
+  - 好友模块通过自己定义的 `UserDirectory` 接口使用 `*user.Service`（`GetProfiles` / `SearchProfiles`），不直接查 users 表。
+  - 前端已完成：好友页（列表、详情、删除、新的朋友、搜索并申请），黑色系主题；聊天页暂为占位。M4 之前没有实时推送，进入好友页或点刷新时拉取。
+  - 实时通知（新申请、申请被处理）在 M4 接入。
 - 待办：登录、注册限流（NFR-05，M6）；WebSocket 携带令牌的方式（M4 决定，避免把令牌放进 URL 参数，否则会被写进访问日志）。
 
 ## 协作方式

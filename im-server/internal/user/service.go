@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -191,3 +193,54 @@ func validatePassword(password string) error {
 func isUpper(c byte) bool { return c >= 'A' && c <= 'Z' }
 func isLower(c byte) bool { return c >= 'a' && c <= 'z' }
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+// GetProfiles 批量查询用户资料，不存在的 ID 直接跳过，返回顺序不保证。
+func (s *Service) GetProfiles(ctx context.Context, ids []int64) ([]Profile, error) {
+	users, err := s.repo.FindByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	return toProfiles(users), nil
+}
+
+// SearchProfiles 按用户名（不区分大小写，完全匹配，走 lower(username) 索引）搜索；
+// keyword 是 10 位数字时再加上按 ID 精确匹配（纯数字用户名也合法，两种都要查，合并去重）。最多 limit 条。
+// 同一个用户同时命中两个条件时，SQL 的 OR 只返回一行，天然去重。
+func (s *Service) SearchProfiles(ctx context.Context, keyword string, limit int) ([]Profile, error) {
+	keyword = strings.TrimSpace(keyword)
+	// 超过用户名最大长度的输入既不可能是用户名，也不可能是 10 位 ID，不必查库
+	if keyword == "" || len(keyword) > maxUsernameLen || limit <= 0 {
+		return nil, nil
+	}
+	users, err := s.repo.SearchByUsernameOrID(ctx, keyword, parseUserID(keyword), limit)
+	if err != nil {
+		return nil, err
+	}
+	return toProfiles(users), nil
+}
+
+// parseUserID keyword 恰好是 10 位数字时返回对应 ID，否则返回 0。
+// 不能只用 strconv.ParseInt：它接受 "+123456789" 这样带符号的写法。
+func parseUserID(keyword string) int64 {
+	if len(keyword) != 10 {
+		return 0
+	}
+	for i := 0; i < len(keyword); i++ {
+		if !isDigit(keyword[i]) {
+			return 0
+		}
+	}
+	id, err := strconv.ParseInt(keyword, 10, 64)
+	if err != nil || id < minUserID {
+		return 0 // 以 0 开头的 10 位数不在合法范围内
+	}
+	return id
+}
+
+func toProfiles(users []User) []Profile {
+	profiles := make([]Profile, 0, len(users))
+	for _, u := range users {
+		profiles = append(profiles, Profile{ID: u.ID, Username: u.Username, AvatarURL: u.AvatarURL})
+	}
+	return profiles
+}

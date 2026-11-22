@@ -10,6 +10,14 @@ const (
 
 	CodeInvalidCredentials = 20001 // 登录失败：用户 ID 或密码错误（同为 401，但前端不应跳转登录页）
 
+	// 好友模块 3xxxx
+	CodeCannotAddSelf         = 30001 // 不能添加自己为好友
+	CodeAlreadyFriends        = 30002 // 已经是好友
+	CodeReverseRequestPending = 30003 // 对方已向你发送申请，应去申请列表处理
+	CodeRequestNotFound       = 30004 // 申请不存在（或不是发给你的）
+	CodeRequestHandled        = 30005 // 申请已被处理
+	CodeTargetUserNotFound    = 30006 // 目标用户不存在
+
 	CodeInternal = 50000
 )
 
