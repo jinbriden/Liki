@@ -8,9 +8,11 @@ Web 端即时通讯软件，个人学习项目（Go 后端 + React 前端 + Post
 - `docker-compose.yml`：本地 PostgreSQL，监听 127.0.0.1:5432，用户 / 密码 / 库名 = im / im123 / im
 - `im-server/`：Go 后端，模块名 `im-server`
   - `cmd/server/main.go`：程序入口，在这里手动组装依赖（repository → service → handler）
-  - `internal/<模块>/`：user、friend、message、gateway，每个模块按 `model.go`、`repository.go`、`service.go`、`handler.go` 分层
+  - `internal/<模块>/`：user、friend、message 按 `model.go`、`repository.go`、`service.go`、`handler.go` 分层；需要实时推送的模块另有 `notify.go`（把 service 的 `Notifier` 接口实现为 WebSocket 推送）
+  - `internal/gateway/`：WebSocket 网关，只做票据鉴权、连接管理、心跳、按 `type` 分发数据包和按用户推送（`Push`），不写业务逻辑；业务模块用 `Handle(type, fn)` 注册处理函数
   - `internal/pkg/response/`：统一响应格式 `{code, msg, data}` 和错误码常量（常量名以代码为准）
-  - `internal/pkg/auth/`：JWT 签发/校验（`JWTManager`，不依赖 gin，WS 网关可复用）和鉴权中间件；handler 用 `auth.UserID(c)` 取当前用户
+  - `internal/pkg/auth/`：JWT 签发/校验（`JWTManager`）和鉴权中间件；handler 用 `auth.UserID(c)` 取当前用户
+  - `internal/pkg/logger/`：slog 初始化（控制台 + JSON 文件）、请求 ID / 访问日志 / panic 恢复中间件、`logger.WithAttrs(ctx, ...)` 把字段挂到 ctx 上
   - `migrations/`：golang-migrate 的 SQL 迁移文件
 - `web/`：React + TS + Vite 前端（antd 6、React Router 8、Zustand 5），结构见 `web/README.md`
   - Node 用 WSL 内 nvm 安装的版本（不要用 PATH 里 Windows 的 npm）
@@ -29,7 +31,10 @@ Web 端即时通讯软件，个人学习项目（Go 后端 + React 前端 + Post
 - 服务开发阶段只监听 `127.0.0.1:8080`。
 - 需要登录的接口注册到 `RegisterRoutes(public, protected)` 的 protected 分组；当前用户 ID 一律取 `auth.UserID(c)`，不信任请求里的用户 ID。
 - 401 分两种错误码：`CodeUnauthorized`(10003) 表示令牌缺失/无效/过期，前端应跳转登录；`CodeInvalidCredentials`(20001) 表示登录失败，前端不跳转。
-- 日志里不能出现密码和令牌。
+- 日志：
+  - 一律用 `slog.XxxContext(ctx, ...)`，ctx 上已挂好 `request_id`、`user_id`（HTTP）或 `conn_id`、`user_id`（WebSocket），不要手动重复记录这几个字段。
+  - 业务事件（注册、登录、好友申请、消息写库等）在 service 层记 Info；正常但频繁的情况（如消息重发去重）记 Debug；handler 只在返回 50000 时记 Error。
+  - 日志里不能出现密码、令牌、WebSocket 票据和消息正文（消息只记长度）；访问日志只记路径，不记查询参数。
 - 时间字段（如 `created_at`）由数据库 `now()` 生成：model 上用 `gorm:"autoCreateTime:false;default:now()"`，GORM 插入时通过 `RETURNING` 取回，保证返回值和库里一致（微秒精度）。不要用 Go 的 `time.Now()` 写入。
 - 接口输出的时间一律转成 UTC（`.UTC()`，JSON 形如 `...Z`）。
 
@@ -46,9 +51,17 @@ migrate -path migrations -database "postgres://im:im123@localhost:5432/im?sslmod
 #   openssl rand -base64 48
 export JWT_SECRET='<你的密钥>'
 go run ./cmd/server
+# 日志：控制台为 text，同时以 JSON 追加写入 logs/im-server.log（已被 .gitignore 忽略），按 request_id / conn_id 检索：
+#   jq 'select(.request_id=="<X-Request-ID 响应头>")' logs/im-server.log
+# 可选环境变量：LOG_LEVEL=debug|info|warn|error（默认 debug）、LOG_FORMAT=text|json、
+#   LOG_FILE=<路径>（设为空字符串则不写文件）、LOG_SQL=true（记录所有 SQL，不含参数值）
 # WSL 里有 http_proxy 时，curl 测本地接口要加 --noproxy '*'
 go build ./...
 go test ./...
+# 消息模块的数据库测试需要独立的测试库 im_test（不要用开发库），没设置 TEST_DATABASE_DSN 时自动跳过：
+#   docker exec im-postgres psql -U im -d im -c "CREATE DATABASE im_test"
+#   migrate -path migrations -database "postgres://im:im123@localhost:5432/im_test?sslmode=disable" up
+TEST_DATABASE_DSN="host=localhost user=im password=im123 dbname=im_test port=5432 sslmode=disable" go test ./...
 
 # 在 web 目录（需先启动后端）
 npm run dev     # http://127.0.0.1:5173
@@ -71,7 +84,18 @@ npm run lint
   - 好友模块通过自己定义的 `UserDirectory` 接口使用 `*user.Service`（`GetProfiles` / `SearchProfiles`），不直接查 users 表。
   - 前端已完成：好友页（列表、详情、删除、新的朋友、搜索并申请），黑色系主题；聊天页暂为占位。M4 之前没有实时推送，进入好友页或点刷新时拉取。
   - 实时通知（新申请、申请被处理）在 M4 接入。
-- 待办：登录、注册限流（NFR-05，M6）；WebSocket 携带令牌的方式（M4 决定，避免把令牌放进 URL 参数，否则会被写进访问日志）。
+- 日志（NFR-13）：已补齐。`gin.New()` + `logger.Middleware()`（请求 ID 写入响应头 `X-Request-ID`、访问日志）+ `logger.Recovery()`；GORM 日志也走 slog（默认只记慢查询和出错的 SQL，唯一约束/外键冲突不算错误）。
+- M4 实时单聊：已完成并验收（迁移 000006、`internal/gateway/`、`internal/message/`、错误码 4xxxx）。端到端脚本验证了票据鉴权、重发去重、多标签页同步、1500 字边界、断线期间的消息重连后补齐（seq 连续）；浏览器里验证了断网发送后自动补发、超长消息本地标记失败。
+  - 心跳：客户端每 25 秒发应用层 ping；服务端每 30 秒发协议层 ping（浏览器网络栈自动回 pong，不受后台标签页定时器节流影响），60 秒收不到任何数据就断开。
+  - 建连：`POST /api/v1/ws/ticket`（需登录）换一次性票据（30 秒、用一次即作废），再连 `GET /api/v1/ws?ticket=`；票据无效时握手阶段返回 401。票据存储、在线状态都是接口 + 内存实现（NFR-10）。
+  - 协议：`{type, version: 1, data}`。
+  - 发消息：`message.send {clientMsgId, toUserId, content}` → 服务端回 `message.ack {clientMsgId, code, msg, message?}`，并向双方所有连接（含发送方自己的其他标签页）推 `message.new {message}`。
+  - 可靠性：按 `(sender_id, client_msg_id)` 去重，重复提交返回已有消息；seq 在事务里 `UPDATE conversations ... RETURNING last_seq` 分配，冲突回滚不留空洞。单元测试 + `im_test` 库上的并发测试覆盖。
+  - 拉取：`GET /api/v1/chats/:peerId/messages?afterSeq=`（增量同步）或 `?beforeSeq=`（向前翻页，都不带为最新一页），返回 `{items, hasMore}`，按 seq 升序。
+  - M4 阶段非好友一律不能发消息（40003），FR-12 的"最多一条"放到 M6。
+  - 好友实时通知：`friend.request.received`（给被申请方）、`friend.request.handled`（给申请方）、`friend.sync`（给操作者自己的其他连接）。
+  - 前端：`src/realtime/socket.ts`（连接、心跳、指数退避重连）、`src/stores/chat.ts`（发送中队列、5 秒未 ACK 重发、30 秒标记失败可重试、seq 不连续时补拉、超长消息只在本地显示为失败）、聊天页。消息暂存内存，IndexedDB 缓存在 M5。
+- 待办：登录、注册限流（NFR-05，M6）；连接建立后令牌过期不会主动断开 WebSocket（重连时换票据会失败，届时跳转登录）。
 
 ## 协作方式
 

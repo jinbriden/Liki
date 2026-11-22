@@ -18,6 +18,11 @@ const (
 	CodeRequestHandled        = 30005 // 申请已被处理
 	CodeTargetUserNotFound    = 30006 // 目标用户不存在
 
+	// 消息模块 4xxxx
+	CodeMessageEmpty   = 40001 // 消息内容为空
+	CodeMessageTooLong = 40002 // 消息超过 1500 字（FR-13）：前端把这条消息标记为发送失败，只保留在本地
+	CodeNotFriends     = 40003 // 对方不是好友，不能发消息（M4 先一律拒绝，M6 按 FR-12 放宽为"最多一条"）
+
 	CodeInternal = 50000
 )
 

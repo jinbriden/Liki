@@ -332,3 +332,48 @@ func TestService_ListRequests(t *testing.T) {
 		t.Errorf("ListIncoming(erin) = %v, %v", got, err)
 	}
 }
+
+func TestService_Notifications(t *testing.T) {
+	svc, _, n := newTestServiceWithNotifier(defaultUsers())
+
+	// 发申请：通知被申请方（带申请人资料），并同步申请人自己的其他连接
+	req := mustSend(t, svc, alice, bob)
+	got := n.take()
+	if len(got) != 2 ||
+		got[0].kind != "received" || got[0].userID != bob || got[0].view.Peer.ID != alice || got[0].view.Request.ID != req.ID ||
+		got[1].kind != "sync" || got[1].userID != alice {
+		t.Fatalf("发申请后的通知 = %+v", got)
+	}
+
+	// 重复申请是幂等返回，不应该再通知一次
+	mustSend(t, svc, alice, bob)
+	if got := n.take(); len(got) != 0 {
+		t.Errorf("重复申请不应通知，got %+v", got)
+	}
+
+	// 同意：通知申请方（带处理人资料和结果），并同步处理人自己的其他连接
+	if err := svc.Accept(ctx, bob, req.ID); err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	got = n.take()
+	if len(got) != 2 ||
+		got[0].kind != "handled" || got[0].userID != alice || got[0].view.Peer.ID != bob || got[0].view.Request.Status != StatusAccepted ||
+		got[1].kind != "sync" || got[1].userID != bob {
+		t.Fatalf("同意后的通知 = %+v", got)
+	}
+
+	// 处理失败（已处理过）不通知
+	_ = svc.Reject(ctx, bob, req.ID)
+	if got := n.take(); len(got) != 0 {
+		t.Errorf("处理失败不应通知，got %+v", got)
+	}
+
+	// 删除好友：不通知对方（FR-08），只同步自己
+	if err := svc.DeleteFriend(ctx, alice, bob); err != nil {
+		t.Fatalf("DeleteFriend: %v", err)
+	}
+	got = n.take()
+	if len(got) != 1 || got[0].kind != "sync" || got[0].userID != alice {
+		t.Errorf("删除好友后的通知 = %+v", got)
+	}
+}

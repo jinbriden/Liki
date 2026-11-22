@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
@@ -29,6 +30,19 @@ type UserDirectory interface {
 	SearchProfiles(ctx context.Context, keyword string, limit int) ([]user.Profile, error)
 }
 
+// Notifier 好友相关的实时通知（FR-07），推送是尽力而为的，不返回错误：
+// 对方离线时收不到，下次登录进入好友页时从申请列表里看到。
+// service 只决定"通知谁、通知什么"，数据包格式由实现决定（见 notify.go），service 不依赖 WebSocket。
+type Notifier interface {
+	// RequestReceived 有人向 toUserID 发送了好友申请，view.Peer 是申请人
+	RequestReceived(ctx context.Context, toUserID int64, view RequestView)
+	// RequestHandled fromUserID 发出的申请被同意或拒绝，view.Peer 是处理申请的人
+	RequestHandled(ctx context.Context, fromUserID int64, view RequestView)
+	// FriendDataChanged userID 自己的好友数据变了（发申请、处理申请、删好友），
+	// 通知他在其他标签页、设备上的连接刷新（FR-04 多处登录同步）
+	FriendDataChanged(ctx context.Context, userID int64)
+}
+
 // SearchResult 搜索结果中的一项
 type SearchResult struct {
 	User     user.Profile
@@ -48,12 +62,13 @@ type Friend struct {
 }
 
 type Service struct {
-	repo  Repository
-	users UserDirectory
+	repo     Repository
+	users    UserDirectory
+	notifier Notifier
 }
 
-func NewService(repo Repository, users UserDirectory) *Service {
-	return &Service{repo: repo, users: users}
+func NewService(repo Repository, users UserDirectory, notifier Notifier) *Service {
+	return &Service{repo: repo, users: users, notifier: notifier}
 }
 
 // Search 按用户名或用户 ID 搜索用户，并标出每个人和 me 的关系（FR-05）。
@@ -140,6 +155,9 @@ func (s *Service) SendRequest(ctx context.Context, me, toUserID int64, message s
 		req := &FriendRequest{FromUserID: me, ToUserID: toUserID, Message: message}
 		err := s.repo.CreateRequest(ctx, req)
 		if err == nil {
+			slog.InfoContext(ctx, "friend request sent", "request_id", req.ID, "to_user_id", toUserID)
+			s.notifier.RequestReceived(ctx, toUserID, RequestView{Request: *req, Peer: s.profileOf(ctx, me)})
+			s.notifier.FriendDataChanged(ctx, me)
 			return req, nil
 		}
 		if !errors.Is(err, ErrPendingExists) {
@@ -197,21 +215,20 @@ func (s *Service) withPeers(ctx context.Context, reqs []FriendRequest, peerID fu
 	return views, nil
 }
 
-// Accept me 同意申请 requestID，双方成为好友（FR-07）。
-// M4：成功后实时通知申请方。
+// Accept me 同意申请 requestID，双方成为好友，并实时通知申请方（FR-07）。
 func (s *Service) Accept(ctx context.Context, me, requestID int64) error {
-	return s.handle(ctx, me, requestID, s.repo.Accept)
+	return s.handle(ctx, me, requestID, StatusAccepted, s.repo.Accept)
 }
 
-// Reject me 拒绝申请 requestID（FR-07）。
-// M4：成功后实时通知申请方。
+// Reject me 拒绝申请 requestID，并实时通知申请方（FR-07）。
 func (s *Service) Reject(ctx context.Context, me, requestID int64) error {
-	return s.handle(ctx, me, requestID, s.repo.Reject)
+	return s.handle(ctx, me, requestID, StatusRejected, s.repo.Reject)
 }
 
 // handle Accept 和 Reject 的公共流程。do 传的是方法值（s.repo.Accept），
 // 已绑定接收者，可以像普通函数一样调用，类似 Java 的方法引用 repo::accept。
-func (s *Service) handle(ctx context.Context, me, requestID int64, do func(ctx context.Context, requestID, toUserID int64) error) error {
+func (s *Service) handle(ctx context.Context, me, requestID int64, status RequestStatus,
+	do func(ctx context.Context, requestID, toUserID int64) error) error {
 	req, err := s.repo.FindRequestByID(ctx, requestID)
 	if err != nil {
 		return err
@@ -224,7 +241,16 @@ func (s *Service) handle(ctx context.Context, me, requestID int64, do func(ctx c
 	if req.Status != StatusPending {
 		return ErrRequestNotPending
 	}
-	return do(ctx, requestID, me)
+	if err := do(ctx, requestID, me); err != nil {
+		return err
+	}
+
+	slog.InfoContext(ctx, "friend request handled", "request_id", requestID, "from_user_id", req.FromUserID, "status", status)
+	// handled_at 由数据库 now() 写入，这里没有取回，推送里不带（申请方需要时可以拉列表）
+	req.Status = status
+	s.notifier.RequestHandled(ctx, req.FromUserID, RequestView{Request: *req, Peer: s.profileOf(ctx, me)})
+	s.notifier.FriendDataChanged(ctx, me)
+	return nil
 }
 
 // ListFriends 我的好友列表，按用户名排序（不区分大小写）、同名再按 ID 排序（FR-09）。
@@ -257,11 +283,17 @@ func (s *Service) ListFriends(ctx context.Context, me int64) ([]Friend, error) {
 }
 
 // DeleteFriend 双向解除好友关系，不通知对方（FR-08）。本来就不是好友时也返回 nil（幂等）。
+// 只同步给自己的其他连接，对方的好友列表要等他下次刷新才会变化。
 func (s *Service) DeleteFriend(ctx context.Context, me, friendID int64) error {
-	return s.repo.DeleteFriendship(ctx, me, friendID)
+	if err := s.repo.DeleteFriendship(ctx, me, friendID); err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "friend deleted", "friend_id", friendID)
+	s.notifier.FriendDataChanged(ctx, me)
+	return nil
 }
 
-// AreFriends 两人是否是好友。供 M4 的消息模块检查非好友限制（FR-12）。
+// AreFriends 两人是否是好友。消息模块用它检查能否发消息（满足 message.FriendChecker 接口）。
 func (s *Service) AreFriends(ctx context.Context, a, b int64) (bool, error) {
 	return s.repo.AreFriends(ctx, a, b)
 }
@@ -275,6 +307,16 @@ func (m profiles) get(id int64) user.Profile {
 		return p
 	}
 	return user.Profile{ID: id}
+}
+
+// profileOf 查单个用户的资料，用于推送。查询失败不影响主流程（申请已经处理成功），只记日志并退化为只有 ID
+func (s *Service) profileOf(ctx context.Context, id int64) user.Profile {
+	m, err := s.profileMap(ctx, []int64{id})
+	if err != nil {
+		slog.WarnContext(ctx, "load profile for notification failed", "profile_user_id", id, "err", err)
+		return user.Profile{ID: id}
+	}
+	return m.get(id)
 }
 
 func (s *Service) profileMap(ctx context.Context, ids []int64) (profiles, error) {

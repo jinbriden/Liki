@@ -14,6 +14,10 @@ export const Code = {
   RequestNotFound: 30004,
   RequestHandled: 30005, // 申请已被处理（比如在另一个标签页处理过）
   TargetUserNotFound: 30006,
+  // 消息模块
+  MessageEmpty: 40001,
+  MessageTooLong: 40002, // 超过 1500 字：消息标记为发送失败，只保留在本地
+  NotFriends: 40003, // 对方不是好友，不能发消息
   Internal: 50000,
   // 以下为前端自定义，不会出现在后端响应里
   Network: -1, // 请求没发出去或没收到响应

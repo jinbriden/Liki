@@ -1,22 +1,34 @@
 import { LogoutOutlined, MessageOutlined, TeamOutlined } from '@ant-design/icons'
-import { Badge, Button, Modal, Popover, Tooltip, Typography } from 'antd'
+import { App, Badge, Button, Modal, Popover, Tooltip, Typography } from 'antd'
 import { useEffect, type ReactNode } from 'react'
 import { NavLink, Outlet } from 'react-router'
+import type { FriendRequest } from '../api/friend'
 import { UserAvatar } from '../components/UserAvatar'
+import { socket } from '../realtime/socket'
 import { useAuthStore } from '../stores/auth'
+import '../stores/chat' // 确保聊天 store 在任何页面都已订阅推送，不在聊天页时收到的消息也不会丢
 import { useFriendStore } from '../stores/friend'
 
 // MainLayout 登录后的主框架：左侧导航栏 + 右侧内容区。
 // 好友页和聊天页分开（FR-09），都通过左侧导航切换。
 export default function MainLayout() {
+  const userId = useAuthStore((s) => s.user?.id)
   const loadIncoming = useFriendStore((s) => s.loadIncoming)
   const pendingCount = useFriendStore((s) => s.incoming.length)
 
-  // 进入主框架时拉一次待处理申请，让导航栏"好友"上的角标在任何页面都能显示。
-  // M4 之前没有实时推送，新申请要等刷新或进入好友页才能看到。
+  // 进入主框架时拉一次待处理申请，让导航栏"好友"上的角标在任何页面都能显示；之后的新申请靠实时推送
   useEffect(() => {
     loadIncoming().catch(() => {}) // 角标拉取失败不打扰用户，好友页会再拉一次并显示错误
   }, [loadIncoming])
+
+  // 登录后建立 WebSocket 长连接，离开主框架（退出登录）时断开（FR-03）
+  useEffect(() => {
+    if (!userId) return
+    socket.start()
+    return () => socket.stop()
+  }, [userId])
+
+  useFriendNotifications()
 
   return (
     <div className="app-shell">
@@ -48,6 +60,33 @@ function NavItem({ to, label, icon, badge = 0 }: { to: string; label: string; ic
   )
 }
 
+// useFriendNotifications 收到好友申请、申请被处理时弹出通知（FR-07）。数据更新在 friend store 里，这里只负责提示
+function useFriendNotifications() {
+  const { notification } = App.useApp()
+
+  useEffect(() => {
+    const offReceived = socket.on('friend.request.received', (data) => {
+      const req = data as FriendRequest
+      notification.info({
+        title: '新的好友申请',
+        description: `${req.user.username}（ID ${req.user.id}）请求添加你为好友${req.message ? `：${req.message}` : ''}`,
+      })
+    })
+    const offHandled = socket.on('friend.request.handled', (data) => {
+      const req = data as FriendRequest
+      const accepted = req.status === 'accepted'
+      notification[accepted ? 'success' : 'info']({
+        title: accepted ? '好友申请已通过' : '好友申请被拒绝',
+        description: accepted ? `${req.user.username} 已同意你的好友申请` : `${req.user.username} 拒绝了你的好友申请`,
+      })
+    })
+    return () => {
+      offReceived()
+      offHandled()
+    }
+  }, [notification])
+}
+
 // UserMenu 导航栏底部自己的头像，点击显示账号信息和退出按钮
 function UserMenu() {
   // RequireAuth 保证渲染到这里时 user 一定存在
@@ -67,7 +106,7 @@ function UserMenu() {
           </Typography.Text>
         </div>
       </div>
-      {/* 退出登录（FR-03）：只清除本地令牌，服务端没有 logout 接口。M4 起还要断开 WebSocket */}
+      {/* 退出登录（FR-03）：只清除本地令牌，服务端没有 logout 接口；令牌清除后 WebSocket 随之断开 */}
       <Button block icon={<LogoutOutlined />} onClick={clear}>
         退出登录
       </Button>

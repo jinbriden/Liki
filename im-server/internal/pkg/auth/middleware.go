@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"im-server/internal/pkg/logger"
 	"im-server/internal/pkg/response"
 )
 
@@ -32,6 +33,8 @@ func Middleware(p TokenParser) gin.HandlerFunc {
 			return
 		}
 		c.Set(ctxKeyUserID, userID)
+		// 把 user_id 挂到请求的 ctx 上：之后 service、repository 带着这个 ctx 打的日志（包括 SQL 日志）都会带上用户 ID
+		c.Request = c.Request.WithContext(logger.WithAttrs(c.Request.Context(), "user_id", userID))
 		c.Next()
 	}
 }

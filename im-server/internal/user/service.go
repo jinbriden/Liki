@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"strconv"
 	"strings"
@@ -85,6 +86,7 @@ func (s *Service) Register(ctx context.Context, username, password string) (*Use
 		if err != nil {
 			return nil, err
 		}
+		slog.InfoContext(ctx, "user registered", "new_user_id", u.ID)
 		return u, nil
 	}
 	return nil, fmt.Errorf("allocate user id: still conflicting after %d attempts", maxIDAttempts)
@@ -113,12 +115,15 @@ var dummyHash = sync.OnceValue(func() []byte {
 func (s *Service) Login(ctx context.Context, userID int64, password string) (*LoginResult, error) {
 	// 只做"不可能正确"的快速拒绝，不校验密码复杂度：以后调整注册规则时，老用户仍要能登录
 	if userID < minUserID || userID > maxUserID || password == "" || len(password) > maxPasswordLen {
+		slog.InfoContext(ctx, "login rejected", "login_user_id", userID, "reason", "malformed")
 		return nil, ErrInvalidCredentials
 	}
 
 	u, err := s.repo.FindByID(ctx, userID)
 	if errors.Is(err, ErrUserNotFound) {
 		_ = bcrypt.CompareHashAndPassword(dummyHash(), []byte(password))
+		// 日志只给开发者看，可以写明具体原因；返回给客户端的仍是同一个错误
+		slog.InfoContext(ctx, "login rejected", "login_user_id", userID, "reason", "user_not_found")
 		return nil, ErrInvalidCredentials
 	}
 	if err != nil {
@@ -127,6 +132,7 @@ func (s *Service) Login(ctx context.Context, userID int64, password string) (*Lo
 
 	err = bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password))
 	if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+		slog.InfoContext(ctx, "login rejected", "login_user_id", userID, "reason", "wrong_password")
 		return nil, ErrInvalidCredentials
 	}
 	if err != nil {
@@ -138,6 +144,7 @@ func (s *Service) Login(ctx context.Context, userID int64, password string) (*Lo
 	if err != nil {
 		return nil, fmt.Errorf("issue token: %w", err)
 	}
+	slog.InfoContext(ctx, "user logged in", "login_user_id", u.ID) // 不记录令牌
 	return &LoginResult{User: u, Token: token, ExpiresAt: expiresAt}, nil
 }
 

@@ -232,8 +232,53 @@ func (d *fakeDirectory) SearchProfiles(ctx context.Context, keyword string, limi
 	return out, nil
 }
 
+// notification fakeNotifier 记录下的一次通知
+type notification struct {
+	kind   string // received / handled / sync
+	userID int64  // 通知给谁
+	view   RequestView
+}
+
+// fakeNotifier 记录 service 发出的通知，测试据此断言"通知了谁、通知了什么"
+type fakeNotifier struct {
+	mu     sync.Mutex
+	events []notification
+}
+
+func (n *fakeNotifier) add(e notification) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.events = append(n.events, e)
+}
+
+func (n *fakeNotifier) RequestReceived(_ context.Context, toUserID int64, view RequestView) {
+	n.add(notification{kind: "received", userID: toUserID, view: view})
+}
+
+func (n *fakeNotifier) RequestHandled(_ context.Context, fromUserID int64, view RequestView) {
+	n.add(notification{kind: "handled", userID: fromUserID, view: view})
+}
+
+func (n *fakeNotifier) FriendDataChanged(_ context.Context, userID int64) {
+	n.add(notification{kind: "sync", userID: userID})
+}
+
+// take 取出并清空已记录的通知
+func (n *fakeNotifier) take() []notification {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := n.events
+	n.events = nil
+	return out
+}
+
 // newTestService 用给定的用户（ID → 用户名）组装 service
 func newTestService(users map[int64]string) (*Service, *fakeRepo) {
+	svc, repo, _ := newTestServiceWithNotifier(users)
+	return svc, repo
+}
+
+func newTestServiceWithNotifier(users map[int64]string) (*Service, *fakeRepo, *fakeNotifier) {
 	dir := &fakeDirectory{}
 	ids := make([]int64, 0, len(users))
 	for id, name := range users {
@@ -242,5 +287,6 @@ func newTestService(users map[int64]string) (*Service, *fakeRepo) {
 	}
 	slices.SortFunc(dir.profiles, func(a, b user.Profile) int { return cmp.Compare(a.ID, b.ID) })
 	repo := newFakeRepo(ids...)
-	return NewService(repo, dir), repo
+	n := &fakeNotifier{}
+	return NewService(repo, dir, n), repo, n
 }

@@ -11,10 +11,11 @@ import {
   type FriendRequest,
 } from '../api/friend'
 import { Code, errorMessage, isApiError } from '../api/client'
+import { socket } from '../realtime/socket'
 import { useAuthStore } from './auth'
 
 // 好友模块的全局状态。页面只读这里的数据、调这里的方法，不直接调 api。
-// M4 接入 WebSocket 后，收到"新申请""申请被处理"推送时也只需要更新这个 store，页面不用改。
+// WebSocket 推送（新申请、申请被处理、其他标签页的改动）也只更新这个 store，页面不用改。
 interface FriendState {
   friends: Friend[]
   incoming: FriendRequest[] // 收到的待处理申请
@@ -115,4 +116,30 @@ useAuthStore.subscribe((state, prev) => {
   if (state.token !== prev.token) {
     useFriendStore.setState(initialData)
   }
+})
+
+// ---------- 实时推送（FR-07、FR-04） ----------
+
+const quiet = (p: Promise<void>) => void p.catch(() => {}) // 后台刷新失败不打扰用户，好友页会显示错误
+
+// 有人向我发了好友申请：直接插到列表最前面，导航栏角标立刻更新
+socket.on('friend.request.received', (data) => {
+  const req = data as FriendRequest
+  const { incoming } = useFriendStore.getState()
+  if (!incoming.some((r) => r.id === req.id)) useFriendStore.setState({ incoming: [req, ...incoming] })
+})
+
+// 我发出的申请被处理了：刷新"我发出的申请"，同意时还要刷新好友列表
+socket.on('friend.request.handled', (data) => {
+  const req = data as FriendRequest
+  quiet(useFriendStore.getState().loadOutgoing())
+  if (req.status === 'accepted') quiet(useFriendStore.getState().loadFriends())
+})
+
+// 我在其他标签页 / 设备上改了好友数据（发申请、处理申请、删好友）
+socket.on('friend.sync', () => quiet(useFriendStore.getState().loadAll()))
+
+// 断线期间可能漏掉推送，重连后整体刷新一次
+socket.onOpen(({ resumed }) => {
+  if (resumed) quiet(useFriendStore.getState().loadAll())
 })

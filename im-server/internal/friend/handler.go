@@ -147,7 +147,7 @@ func fail(c *gin.Context, action string, err error) {
 	case errors.Is(err, ErrTargetUserNotFound):
 		response.Fail(c, http.StatusNotFound, response.CodeTargetUserNotFound, msgTargetUserNotFound)
 	default:
-		slog.Error(action+" failed", "userId", auth.UserID(c), "err", err)
+		slog.ErrorContext(c.Request.Context(), action+" failed", "err", err) // ctx 上已有 request_id、user_id
 		response.Fail(c, http.StatusInternalServerError, response.CodeInternal, msgInternal)
 	}
 }

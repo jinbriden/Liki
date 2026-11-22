@@ -23,7 +23,7 @@ export default function FriendsPage() {
   const [filter, setFilter] = useState('')
   const [addOpen, setAddOpen] = useState(false)
 
-  // 每次进入好友页都刷新一次（M4 之前没有实时推送）。错误已记录在 store.error 里，这里不再处理
+  // 每次进入好友页都刷新一次，兜底实时推送没覆盖到的变化（例如对方删除了我）。错误已记录在 store.error 里
   useEffect(() => {
     loadAll().catch(() => {})
   }, [loadAll])

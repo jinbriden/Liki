@@ -84,7 +84,7 @@ func (h *Handler) register(c *gin.Context) {
 		response.Fail(c, http.StatusBadRequest, response.CodeInvalidParam, msgInvalidPassword)
 		return
 	case err != nil:
-		slog.Error("register failed", "err", err)
+		slog.ErrorContext(c.Request.Context(), "register failed", "err", err)
 		response.Fail(c, http.StatusInternalServerError, response.CodeInternal, msgInternal)
 		return
 	}
@@ -105,7 +105,7 @@ func (h *Handler) login(c *gin.Context) {
 		response.Fail(c, http.StatusUnauthorized, response.CodeInvalidCredentials, msgInvalidCredentials)
 		return
 	case err != nil:
-		slog.Error("login failed", "userId", req.UserID, "err", err) // 不记录密码和令牌
+		slog.ErrorContext(c.Request.Context(), "login failed", "login_user_id", req.UserID, "err", err) // 不记录密码和令牌
 		response.Fail(c, http.StatusInternalServerError, response.CodeInternal, msgInternal)
 		return
 	}
@@ -126,7 +126,7 @@ func (h *Handler) me(c *gin.Context) {
 		response.Fail(c, http.StatusUnauthorized, response.CodeUnauthorized, msgUnauthorized)
 		return
 	case err != nil:
-		slog.Error("get current user failed", "userId", userID, "err", err)
+		slog.ErrorContext(c.Request.Context(), "get current user failed", "err", err) // user_id 已由鉴权中间件挂在 ctx 上
 		response.Fail(c, http.StatusInternalServerError, response.CodeInternal, msgInternal)
 		return
 	}

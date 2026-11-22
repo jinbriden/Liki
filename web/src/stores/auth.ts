@@ -49,7 +49,7 @@ export const useAuthStore = create<AuthState>()((set) => ({
   },
   setUser: (user) => set({ user }),
   setNewUserId: (id) => set({ newUserId: id }),
-  // 退出登录（FR-03）和令牌失效都走这里。M4 接入 WebSocket 后，在这里断开长连接。
+  // 退出登录（FR-03）和令牌失效都走这里。WebSocket 订阅了令牌变化，会随之断开（见 realtime/socket.ts）
   clear: () => {
     writeToken(null)
     set({ token: null, user: null, newUserId: null })

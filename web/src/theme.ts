@@ -10,6 +10,7 @@ export const palette = {
   text: '#e8e8ea',
   primary: '#4f7cff', // 低饱和蓝，只用于主按钮、角标、链接
   danger: '#e5484d',
+  bubbleMine: '#2e2f36', // 自己发的消息气泡（只在 index.css 里使用）
 }
 
 export const themeConfig: ThemeConfig = {
