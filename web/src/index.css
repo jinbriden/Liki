@@ -1,16 +1,33 @@
-/* 配色变量，与 src/theme.ts 的 palette 保持一致 */
+/* 设计变量，与 src/theme.ts 的 palette 保持一致 */
 :root {
-  --liki-bg: #0e0e10;
-  --liki-panel: #151517;
-  --liki-hover: #1c1c20;
-  --liki-active: #25252a;
-  --liki-border: #26262b;
-  --liki-text: #e8e8ea;
-  --liki-text-2: #8b8b93;
-  --liki-text-3: #5f5f67;
-  --liki-primary: #4f7cff;
+  /* 三层背景明度差：导航栏 < 会话列表 < 聊天画布 < 卡片 / 气泡 */
+  --liki-nav: #0e1015;
+  --liki-panel: #14171f;
+  --liki-bg: #181b23;
+  --liki-card: #222632;
+  --liki-input: #20242f;
+  --liki-hover: rgba(255, 255, 255, 0.04);
+  --liki-active: #222632;
+  --liki-border: rgba(255, 255, 255, 0.06); /* 全局分割线 */
+  --liki-border-strong: rgba(255, 255, 255, 0.08);
+  --liki-border-focus: rgba(255, 255, 255, 0.18);
+
+  --liki-text: #eceff4;
+  --liki-text-2: #8a93a6; /* 次级：预览、时间、ID */
+  --liki-text-3: #5c6475; /* 弱提示 */
+
+  --liki-accent: #f3e38a; /* 主强调色：只用于核心操作 */
+  --liki-accent-hover: #f7eb9f;
+  --liki-on-accent: #14171f;
+  --liki-teal: #5eead4; /* 点缀：在线状态、导航指示条 */
+  --liki-pink: #f472b6; /* 点缀：未读 */
   --liki-danger: #e5484d;
-  --liki-bubble-mine: #2e2f36; /* 自己发的消息气泡：比对方的略浅的中性灰，不用强调色 */
+
+  --liki-bubble-peer: #222632;
+  --liki-bubble-mine: #f3e38a; /* 自己的气泡：实心淡黄 + 深色字（--liki-on-accent） */
+
+  --liki-stream-width: 920px; /* 消息流和输入框的最大宽度，宽屏下居中 */
+  --liki-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
 
   color-scheme: dark; /* 滚动条、原生控件也用暗色 */
 }
@@ -41,34 +58,32 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
-  padding: 16px 0;
-  background: var(--liki-panel);
+  gap: 6px;
+  padding: 16px 0 18px;
+  background: var(--liki-nav);
   border-right: 1px solid var(--liki-border);
 }
 
+/* 应用图标：单色线条，不做成头像的样子，避免和底部的用户头像重复 */
 .app-logo {
   width: 36px;
   height: 36px;
-  margin-bottom: 12px;
-  border-radius: 8px;
+  margin-bottom: 14px;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--liki-active);
   color: var(--liki-text);
-  font-weight: 600;
-  font-size: 18px;
 }
 
 .app-nav-item {
-  width: 44px;
-  height: 44px;
-  border-radius: 8px;
+  position: relative;
+  width: 42px;
+  height: 42px;
+  border-radius: 10px;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--liki-text-2);
+  color: var(--liki-text-3);
   font-size: 20px;
   transition:
     background 0.15s,
@@ -77,16 +92,61 @@ body {
 
 .app-nav-item:hover {
   background: var(--liki-hover);
-  color: var(--liki-text);
+  color: var(--liki-text-2);
 }
 
 .app-nav-item.active {
-  background: var(--liki-active);
+  background: rgba(255, 255, 255, 0.06);
   color: var(--liki-text);
+}
+
+/* 激活态左侧的细指示条，贴着导航栏左边缘 */
+.app-nav-item::before {
+  content: '';
+  position: absolute;
+  left: -11px;
+  top: 50%;
+  width: 3px;
+  height: 0;
+  border-radius: 0 3px 3px 0;
+  background: var(--liki-teal);
+  transform: translateY(-50%);
+  transition: height 0.15s;
+}
+
+.app-nav-item.active::before {
+  height: 18px;
 }
 
 .app-nav-spacer {
   flex: 1;
+}
+
+.app-nav-me {
+  position: relative;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  cursor: pointer;
+  line-height: 0;
+}
+
+/* 头像右下角的在线状态点：已连接为青色，连接中 / 断开为灰色 */
+.presence-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--liki-nav);
+  background: var(--liki-text-3);
+  transition: background 0.2s;
+}
+
+.presence-dot.online {
+  background: var(--liki-teal);
 }
 
 .app-main {
@@ -98,7 +158,7 @@ body {
 /* ---------- 列表栏 + 详情区 ---------- */
 
 .list-pane {
-  width: 300px;
+  width: 272px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
@@ -110,23 +170,52 @@ body {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 16px 12px 12px 16px;
+  min-height: 52px;
+  box-sizing: border-box;
+  padding: 10px 16px 6px;
 }
 
 .list-pane-title {
   flex: 1;
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 600;
 }
 
+.list-pane-count {
+  font-size: 12px;
+  color: var(--liki-text-3);
+}
+
 .list-pane-filter {
-  padding: 0 12px 12px;
+  padding: 4px 10px 12px;
+}
+
+/* 搜索框：柔和的圆角填充样式，聚焦时微微提亮 */
+.list-pane-filter .ant-input-affix-wrapper,
+.list-pane-filter .ant-input-outlined {
+  height: 36px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.035);
+  border-color: var(--liki-border-strong);
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+
+.list-pane-filter .ant-input-affix-wrapper:hover {
+  border-color: var(--liki-border-strong);
+}
+
+.list-pane-filter .ant-input-affix-wrapper:focus-within {
+  background: rgba(255, 255, 255, 0.055);
+  border-color: var(--liki-border-focus);
+  box-shadow: none;
 }
 
 .list-pane-body {
   flex: 1;
   overflow-y: auto;
-  padding: 0 8px 8px;
+  padding: 0 5px 10px;
 }
 
 .list-section-title {
@@ -135,24 +224,32 @@ body {
   color: var(--liki-text-3);
 }
 
+/* 列表项：左右留白 + 圆角，选中时是轻微浮起的卡片；平时降低次级信息的明度，悬停 / 选中时再提高对比度 */
 .list-item {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 8px 10px;
-  border-radius: 6px;
+  margin-bottom: 2px;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 10px;
   color: var(--liki-text);
   text-decoration: none;
   cursor: pointer;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
 }
 
 .list-item:hover {
-  background: var(--liki-hover);
+  background: rgba(255, 255, 255, 0.03);
   color: var(--liki-text);
 }
 
 .list-item.active {
-  background: var(--liki-active);
+  background: var(--liki-card);
+  border-color: var(--liki-border-strong);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
 }
 
 .list-item-main {
@@ -168,6 +265,12 @@ body {
 
 .list-item-sub {
   font-size: 12px;
+  color: var(--liki-text-3);
+  transition: color 0.15s;
+}
+
+.list-item:hover .list-item-sub,
+.list-item.active .list-item-sub {
   color: var(--liki-text-2);
 }
 
@@ -179,7 +282,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--liki-active);
+  background: var(--liki-card);
   color: var(--liki-text-2);
   font-size: 18px;
 }
@@ -235,7 +338,7 @@ body {
   padding: 12px 16px;
   border: 1px solid var(--liki-border);
   border-radius: 8px;
-  background: var(--liki-panel);
+  background: var(--liki-card);
 }
 
 .profile-meta-row {
@@ -271,7 +374,7 @@ body {
   margin-bottom: 8px;
   border: 1px solid var(--liki-border);
   border-radius: 8px;
-  background: var(--liki-panel);
+  background: var(--liki-card);
 }
 
 .card-item-main {
@@ -333,12 +436,20 @@ body {
   gap: 8px;
 }
 
-/* ---------- 聊天 ---------- */
+
+/* ---------- 聊天：会话列表项 ---------- */
 
 .chat-item-head {
   display: flex;
   align-items: baseline;
   gap: 8px;
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.chat-item-foot .list-item-sub {
+  font-size: 13px;
+  color: var(--liki-text-2);
 }
 
 .chat-item-head .list-item-title {
@@ -350,6 +461,24 @@ body {
   flex-shrink: 0;
   font-size: 12px;
   color: var(--liki-text-3);
+  transition: color 0.15s;
+}
+
+.list-item:hover .chat-item-time,
+.list-item.active .chat-item-time {
+  color: var(--liki-text-2);
+}
+
+.chat-item-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.chat-item-foot .list-item-title {
+  flex: 1;
+  min-width: 0;
 }
 
 .chat-connection {
@@ -357,65 +486,225 @@ body {
   color: var(--liki-text-2);
 }
 
+/* ---------- 聊天：对话区 ---------- */
+
 .chat-pane {
-  overflow: hidden; /* 滚动交给消息列表，输入框固定在底部 */
+  overflow: hidden; /* 滚动交给消息列表，输入框悬浮在底部 */
 }
 
 .chat {
   height: 100%;
   display: flex;
   flex-direction: column;
+  background: var(--liki-bg);
 }
 
 .chat-header {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 12px 20px;
+  height: 52px;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  padding: 0 14px 0 22px;
   border-bottom: 1px solid var(--liki-border);
 }
 
 .chat-header-name {
-  font-size: 15px;
+  font-size: 16px;
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* ID 做成细边框的等宽小标签，降低视觉干扰 */
 .chat-header-id {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  font-family: var(--liki-mono);
   font-size: 12px;
-  color: var(--liki-text-3);
+  line-height: 18px;
+  color: var(--liki-text-2);
 }
 
+.chat-header-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+}
+
+.chat-header-actions .ant-btn {
+  color: var(--liki-text-2);
+  font-size: 17px;
+}
+
+.chat-header-actions .ant-btn:hover {
+  color: var(--liki-text);
+}
+
+/* 消息区和浮在它上面的横条、按钮 */
+.chat-body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 滚动容器占满宽度（滚动条贴在右边缘），里面的 .chat-stream 限宽居中 */
 .chat-messages {
   flex: 1;
   overflow-y: auto;
-  padding: 12px 20px;
+  padding: 16px 0 8px;
+  position: relative; /* 让消息行的 offsetTop 相对消息区计算（跳转定位用）；.chat-stream 不能再设定位，否则会改变 offsetParent */
+  /* 关掉浏览器的滚动锚定：向上翻页时由代码自己补偿滚动位置（ChatPage 的 prepend）。
+     Chrome 默认会自动补偿一次，再加上代码的补偿就会多滚一截，中间的消息被跳过；Safari 又不支持自动补偿，所以统一由代码做 */
+  overflow-anchor: none;
+}
+
+.chat-stream {
+  max-width: var(--liki-stream-width);
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+/* 顶部"N 条新消息"横条（FR-15），和消息流同宽居中 */
+.chat-unread-bar {
+  position: absolute;
+  top: 10px;
+  left: 24px;
+  right: 24px;
+  max-width: calc(var(--liki-stream-width) - 48px);
+  margin: 0 auto;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px 4px 14px;
+  border: 1px solid var(--liki-border-strong);
+  border-radius: 10px;
+  background: var(--liki-card);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  font-size: 13px;
+  color: var(--liki-text);
+}
+
+.chat-unread-actions {
+  display: flex;
+  gap: 4px;
+}
+
+/* "以下为新消息"分隔线：粉色细线 + 小字，标出未读从哪里开始 */
+.chat-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 18px 0 4px;
+  font-size: 12px;
+  color: var(--liki-pink);
+}
+
+.chat-divider::before,
+.chat-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: rgba(244, 114, 182, 0.28);
+}
+
+.chat-jump-bottom {
+  position: absolute;
+  bottom: 12px;
+  /* 和消息流的右边缘对齐：窄屏时贴右 24px，宽屏时跟着居中的消息流走 */
+  right: max(24px, calc((100% - var(--liki-stream-width)) / 2 + 24px));
+  z-index: 2;
+}
+
+.chat-jump-bottom.ant-btn {
+  background: var(--liki-card);
+  border-color: var(--liki-border-strong);
+  color: var(--liki-text-2);
+}
+
+.chat-loading-mask {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(24, 27, 35, 0.6);
 }
 
 .chat-more,
-.chat-empty,
-.chat-time {
+.chat-empty {
   text-align: center;
   padding: 8px 0;
   font-size: 12px;
   color: var(--liki-text-3);
 }
 
+/* 跨时段的时间分隔：居中的胶囊 */
+.chat-time {
+  display: flex;
+  justify-content: center;
+  margin: 20px 0 4px;
+}
+
+.chat-time > span {
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 11px;
+  color: var(--liki-text-3);
+}
+
+/* ---------- 聊天：消息行与连续消息分组 ---------- */
+
+.msg-wrap {
+  position: relative;
+}
+
+/* 已读检测标记：贴在每条消息底部的 1px 元素，进入可视范围 = 这条消息的底边出现在屏幕上 */
+.msg-seen {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  pointer-events: none;
+}
+
+/* 组内间距 4px，组与组之间 18px（组的第一条 / 单独一条） */
 .msg-row {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  margin: 10px 0;
+  margin-top: 4px;
+}
+
+.msg-row.first,
+.msg-row.single {
+  margin-top: 18px;
 }
 
 .msg-row.mine {
-  flex-direction: row-reverse;
+  justify-content: flex-end; /* 自己的消息不显示头像，直接靠右 */
+}
+
+/* 头像位：只有组的第一条放头像，后面的保留同样宽度的缩进，气泡左右对齐 */
+.msg-avatar {
+  width: 32px;
+  flex-shrink: 0;
 }
 
 .msg-body {
-  max-width: min(70%, 560px);
+  min-width: 0;
+  max-width: min(70%, 600px);
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -425,30 +714,78 @@ body {
   align-items: flex-end;
 }
 
+/* 一行里依次是：气泡、发送状态、时间。自己的消息整行反向，显示为 时间、状态、气泡 */
 .msg-line {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 8px;
   max-width: 100%;
 }
 
+.msg-row.mine .msg-line {
+  flex-direction: row-reverse;
+}
+
 .msg-bubble {
   min-width: 0;
-  padding: 8px 12px;
-  border-radius: 8px;
-  background: var(--liki-active);
-  line-height: 1.6;
+  padding: 7px 14px;
+  border-radius: 12px;
+  background: var(--liki-bubble-peer);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  font-size: 15px;
+  line-height: 1.55;
   white-space: pre-wrap; /* 保留换行和连续空格 */
   word-break: break-word;
   overflow-wrap: anywhere; /* 很长的英文单词或链接也能换行 */
 }
 
 .msg-row.mine .msg-bubble {
+  border-radius: 16px;
+  border-color: transparent;
   background: var(--liki-bubble-mine);
+  color: var(--liki-on-accent);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+/* 组内按位置做差异化圆角：靠近头像（对方）/ 靠右边缘（自己）一侧的衔接处收成 6px（顺序：左上 右上 右下 左下） */
+.msg-row.first .msg-bubble {
+  border-radius: 12px 12px 12px 6px;
+}
+.msg-row.middle .msg-bubble {
+  border-radius: 6px 12px 12px 6px;
+}
+.msg-row.last .msg-bubble {
+  border-radius: 6px 12px 12px 12px;
+}
+.msg-row.mine.first .msg-bubble {
+  border-radius: 16px 16px 6px 16px;
+}
+.msg-row.mine.middle .msg-bubble {
+  border-radius: 16px 6px 6px 16px;
+}
+.msg-row.mine.last .msg-bubble {
+  border-radius: 16px 6px 16px 16px;
+}
+
+/* 单条消息的时间：默认隐藏，悬停到这一行时淡入 */
+.msg-time {
+  flex-shrink: 0;
+  padding-bottom: 4px;
+  font-size: 11px;
+  color: var(--liki-text-3);
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 0.15s;
+  user-select: none;
+}
+
+.msg-row:hover .msg-time {
+  opacity: 1;
 }
 
 .msg-status {
   flex-shrink: 0;
+  padding-bottom: 6px;
   font-size: 14px;
   color: var(--liki-text-3);
 }
@@ -468,18 +805,60 @@ body {
   color: var(--liki-danger);
 }
 
+/* ---------- 聊天：悬浮输入区 ---------- */
+
+.chat-composer-wrap {
+  flex-shrink: 0;
+  padding: 4px 24px 16px;
+}
+
+/* 和消息流同宽居中的悬浮卡片；里面的输入框聚焦时提亮边框 */
 .chat-composer {
-  border-top: 1px solid var(--liki-border);
-  padding: 8px 12px 12px;
-  background: var(--liki-panel);
+  max-width: calc(var(--liki-stream-width) - 48px);
+  margin: 0 auto;
+  padding: 12px 12px 10px 10px;
+  border: 1px solid var(--liki-border-strong);
+  border-radius: 14px;
+  background: var(--liki-input);
+  transition: border-color 0.15s;
+}
+
+.chat-composer:focus-within {
+  border-color: var(--liki-border-focus);
+}
+
+/* 文本域本身不画边框、背景和聚焦轮廓（antd 的无边框文本域聚焦时会画一圈 outline），聚焦反馈只由外层卡片的边框承担 */
+.chat-composer .ant-input,
+.chat-composer .ant-input:focus,
+.chat-composer .ant-input:hover {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  outline: none;
+  font-size: 15px;
 }
 
 .chat-composer-footer {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 12px;
-  margin-top: 4px;
+  gap: 8px;
+  margin-top: 10px;
+  padding-left: 2px;
+}
+
+.chat-composer-tools {
+  display: flex;
+  gap: 4px;
+  margin-right: auto;
+}
+
+.chat-composer-tools .ant-btn {
+  color: var(--liki-text-2);
+  font-size: 18px;
+}
+
+.chat-composer-tools .ant-btn:hover {
+  color: var(--liki-text);
 }
 
 .chat-count {
@@ -491,10 +870,29 @@ body {
   color: var(--liki-danger);
 }
 
+/* 发送按钮：圆角矩形；空输入时灰底灰字（低饱和禁用态），有内容时点亮为淡黄（antd primary） */
+.chat-send.ant-btn {
+  min-width: 58px;
+  height: 34px;
+  padding: 0 16px;
+  border-radius: 9px;
+  font-weight: 600;
+}
+
+.chat-send.ant-btn:disabled {
+  border-color: transparent;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--liki-text-3);
+}
+
 .chat-disabled {
-  border-top: 1px solid var(--liki-border);
-  padding: 20px;
+  max-width: calc(var(--liki-stream-width) - 48px);
+  margin: 0 auto;
+  box-sizing: border-box;
+  padding: 18px;
+  border: 1px solid var(--liki-border);
+  border-radius: 14px;
+  background: var(--liki-input);
   text-align: center;
   color: var(--liki-text-3);
-  background: var(--liki-panel);
 }

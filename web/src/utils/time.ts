@@ -26,3 +26,9 @@ export function formatDate(iso: string): string {
   const d = new Date(iso)
   return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`
 }
+
+// formatClock 只显示时刻：14:05（消息悬停时显示）
+export function formatClock(iso: string): string {
+  const d = new Date(iso)
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`
+}

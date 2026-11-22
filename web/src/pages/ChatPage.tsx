@@ -1,19 +1,35 @@
-import { CloseCircleFilled, CommentOutlined, LoadingOutlined, SearchOutlined } from '@ant-design/icons'
-import { Alert, App, Button, Empty, Input, Spin, Tooltip } from 'antd'
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
+import {
+  ArrowDownOutlined,
+  CloseCircleFilled,
+  CommentOutlined,
+  LoadingOutlined,
+  PaperClipOutlined,
+  SearchOutlined,
+  SmileOutlined,
+} from '@ant-design/icons'
+import { Alert, App, Badge, Button, Empty, Input, Spin, Tooltip } from 'antd'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
 import { NavLink, useParams } from 'react-router'
+import type { Profile } from '../api/friend'
 import { MAX_MESSAGE_LEN, messageLength } from '../api/message'
 import { UserAvatar } from '../components/UserAvatar'
 import { useAuthStore } from '../stores/auth'
 import { useChatStore, type ChatMessage, type Conversation } from '../stores/chat'
+import { unreadOf, useChatListStore } from '../stores/chatList'
 import { useFriendStore } from '../stores/friend'
-import { formatTime } from '../utils/time'
+import { formatClock, formatTime } from '../utils/time'
 
 const NO_MESSAGES: ChatMessage[] = [] // 固定的空数组：每次渲染都 [] 会生成新引用，让依赖它的 effect 每次都执行
+const EDGE = 200 // 距离顶部 / 底部多少像素以内就开始加载更早 / 更新的消息
+const NEAR_BOTTOM = 80 // 距离底部多少像素以内算"在底部"：新消息到来时自动滚到底
+const TIME_DIVIDER_GAP = 5 * 60_000 // 和上一条相隔超过 5 分钟，插入时间分隔
+const GROUP_GAP = 3 * 60_000 // 同一发送者 3 分钟内的连续消息归为一组（只在组的第一条显示头像）
 
 const itemClass = ({ isActive }: { isActive: boolean }) => 'list-item' + (isActive ? ' active' : '')
+const displayName = (p: Profile) => p.username || `用户 ${p.id}`
+const time = (iso: string | undefined) => (iso ? Date.parse(iso) : 0)
 
-// ChatPage 聊天页：左侧是可以聊天的好友（M5 改为会话列表，带未读数），右侧是与某人的对话。
+// ChatPage 聊天页：左侧是会话列表（FR-14），右侧是与某人的对话。
 //   /chat          → 空状态
 //   /chat/:peerId  → 与 peerId 的对话
 export default function ChatPage() {
@@ -22,14 +38,14 @@ export default function ChatPage() {
 
   return (
     <>
-      <ChatList />
+      <ChatList activePeer={id > 0 ? id : null} />
       <section className="detail-pane chat-pane">
         {id > 0 ? (
           <ChatPanel key={id} peerId={id} />
         ) : (
           <div className="placeholder">
             <CommentOutlined className="placeholder-icon" />
-            <div>选择一位好友开始聊天</div>
+            <div>选择一个会话开始聊天</div>
           </div>
         )}
       </section>
@@ -37,57 +53,109 @@ export default function ChatPage() {
   )
 }
 
-// ---------- 左侧列表 ----------
+// usePeer 对方的资料：会话列表里有就用它（包括已经不是好友的人），否则用好友列表，都没有时只显示 ID
+function usePeer(peerId: number): Profile {
+  const fromChat = useChatListStore((s) => s.chats[peerId]?.peer)
+  const friend = useFriendStore((s) => s.friends.find((f) => f.id === peerId))
+  if (fromChat?.username) return fromChat
+  if (friend) return { id: friend.id, username: friend.username, avatarUrl: friend.avatarUrl }
+  return fromChat ?? { id: peerId, username: '', avatarUrl: '' }
+}
 
-function ChatList() {
+// ---------- 左侧会话列表 ----------
+
+interface ListItem {
+  peer: Profile
+  lastAt: number
+  preview: string
+  unread: number
+  temp: boolean // 临时项：还没有任何消息，只是当前打开着
+}
+
+function ChatList({ activePeer }: { activePeer: number | null }) {
+  const chats = useChatListStore((s) => s.chats)
+  const listLoaded = useChatListStore((s) => s.loaded)
+  const listError = useChatListStore((s) => s.error)
+  const locals = useChatStore((s) => s.locals)
   const friends = useFriendStore((s) => s.friends)
-  const loaded = useFriendStore((s) => s.loaded)
+  const friendsLoaded = useFriendStore((s) => s.loaded)
   const loadFriends = useFriendStore((s) => s.loadFriends)
-  const convs = useChatStore((s) => s.convs)
   const [filter, setFilter] = useState('')
 
+  // 好友列表用于：临时项显示对方资料、判断能不能发消息
   useEffect(() => {
-    if (!loaded) loadFriends().catch(() => {})
-  }, [loaded, loadFriends])
+    if (!friendsLoaded) loadFriends().catch(() => {})
+  }, [friendsLoaded, loadFriends])
 
-  // 有消息的会话按最后一条消息的时间倒序排在前面，其余按用户名（好友列表本身已排序）
+  // 列表 = 有消息的会话 ∪ 只有本地待发送消息的会话 ∪ 当前打开的临时项；按最后一条消息的时间倒序，临时项在最前
   const items = useMemo(() => {
+    const ids = new Set<number>(Object.keys(chats).map(Number))
+    for (const [peer, list] of Object.entries(locals)) if (list.length > 0) ids.add(Number(peer))
+    if (activePeer !== null) ids.add(activePeer)
+
+    const out: ListItem[] = []
+    for (const id of ids) {
+      const s = chats[id]
+      const local = locals[id]?.at(-1)
+      const friend = friends.find((f) => f.id === id)
+      const peer = s?.peer.username ? s.peer : friend ? friend : (s?.peer ?? { id, username: '', avatarUrl: '' })
+      const serverAt = time(s?.lastMessageAt)
+      const localAt = time(local?.createdAt)
+      let preview = ''
+      if (local && localAt >= serverAt) {
+        preview = (local.status === 'failed' ? '[发送失败] ' : '[发送中] ') + local.content
+      } else if (s?.lastMessage) {
+        preview = s.lastMessage.content
+      }
+      out.push({
+        peer,
+        lastAt: Math.max(serverAt, localAt),
+        preview: preview.replace(/\s+/g, ' '),
+        unread: unreadOf(s),
+        temp: !s && !local,
+      })
+    }
+
     const keyword = filter.trim().toLowerCase()
-    const list = friends
-      .filter((f) => !keyword || f.username.toLowerCase().includes(keyword) || String(f.id).includes(keyword))
-      .map((f) => ({ friend: f, last: lastMessage(convs[f.id]) }))
-    return list.sort((a, b) => (b.last?.createdAt ?? '').localeCompare(a.last?.createdAt ?? ''))
-  }, [friends, convs, filter])
+    return out
+      .filter((it) => !keyword || it.peer.username.toLowerCase().includes(keyword) || String(it.peer.id).includes(keyword))
+      .sort((a, b) => Number(b.temp) - Number(a.temp) || b.lastAt - a.lastAt)
+  }, [chats, locals, friends, activePeer, filter])
 
   return (
     <aside className="list-pane">
       <div className="list-pane-header">
         <span className="list-pane-title">聊天</span>
-        <ConnectionIndicator />
+        {/* 连接正常时显示会话数，断线时换成连接状态 */}
+        <ConnectionIndicator>
+          <span className="list-pane-count">{Object.keys(chats).length} 个会话</span>
+        </ConnectionIndicator>
       </div>
       <div className="list-pane-filter">
         <Input
           allowClear
-          prefix={<SearchOutlined style={{ color: 'var(--liki-text-3)' }} />}
-          placeholder="搜索好友"
+          prefix={<SearchOutlined style={{ color: 'var(--liki-text-2)', fontSize: 15 }} />}
+          placeholder="搜索会话"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
         />
       </div>
       <div className="list-pane-body">
-        {loaded && friends.length === 0 && (
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有好友，先去好友页添加吧" />
+        {listError && !listLoaded && <Alert type="error" title={listError} showIcon style={{ margin: 8 }} />}
+        {listLoaded && items.length === 0 && (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有会话，去好友页找人聊聊吧" />
         )}
-        {items.map(({ friend, last }) => (
-          <NavLink key={friend.id} to={`/chat/${friend.id}`} className={itemClass}>
-            <UserAvatar user={friend} size={36} />
+        {items.map((it) => (
+          <NavLink key={it.peer.id} to={`/chat/${it.peer.id}`} className={itemClass}>
+            <UserAvatar user={it.peer} size={40} />
             <div className="list-item-main">
               <div className="chat-item-head">
-                <span className="list-item-title">{friend.username}</span>
-                {last && <span className="chat-item-time">{formatTime(last.createdAt)}</span>}
+                <span className="list-item-title">{displayName(it.peer)}</span>
+                {it.lastAt > 0 && <span className="chat-item-time">{formatTime(new Date(it.lastAt).toISOString())}</span>}
               </div>
-              <div className="list-item-sub list-item-title">
-                {last ? previewOf(last) : `ID ${friend.id}`}
+              <div className="chat-item-foot">
+                <span className="list-item-sub list-item-title">{it.temp ? `ID ${it.peer.id}` : it.preview}</span>
+                {it.unread > 0 && <Badge count={it.unread} overflowCount={99} size="small" />}
               </div>
             </div>
           </NavLink>
@@ -97,19 +165,10 @@ function ChatList() {
   )
 }
 
-function lastMessage(c: Conversation | undefined): ChatMessage | undefined {
-  return c?.messages[c.messages.length - 1]
-}
-
-function previewOf(m: ChatMessage) {
-  const prefix = m.status === 'failed' ? '[发送失败] ' : m.status === 'sending' ? '[发送中] ' : ''
-  return prefix + m.content.replace(/\s+/g, ' ')
-}
-
-// ConnectionIndicator 连接不正常时在标题旁显示状态
-function ConnectionIndicator() {
+// ConnectionIndicator 连接不正常时在标题旁显示状态，正常时显示 children
+function ConnectionIndicator({ children }: { children?: ReactNode }) {
   const connection = useChatStore((s) => s.connection)
-  if (connection === 'open' || connection === 'idle') return null
+  if (connection === 'open' || connection === 'idle') return children
   return (
     <span className="chat-connection">
       <LoadingOutlined /> {connection === 'connecting' ? '连接中' : '连接已断开，正在重连'}
@@ -119,115 +178,335 @@ function ConnectionIndicator() {
 
 // ---------- 右侧对话 ----------
 
+// compose 对话框里实际显示的消息：窗口内已确认的消息 + 时间落在窗口范围内的本地消息（发送中、发送失败），按时间合并。
+// 窗口不在最新时，只显示时间在窗口最后一条之前的本地消息；新发的消息要等回到最新才显示。
+function compose(conv: Conversation | undefined, locals: ChatMessage[]): ChatMessage[] {
+  const win = conv?.messages ?? NO_MESSAGES
+  if (!conv?.ready) return locals.length > 0 ? locals : NO_MESSAGES
+  const lo = conv.hasMoreBefore && win.length > 0 ? time(win[0].createdAt) : -Infinity
+  const hi = conv.atLatest ? Infinity : time(win.at(-1)?.createdAt)
+  const shown = locals.filter((m) => time(m.createdAt) >= lo && time(m.createdAt) <= hi)
+  if (shown.length === 0) return win
+  const out: ChatMessage[] = []
+  let j = 0
+  for (const m of win) {
+    while (j < shown.length && time(shown[j].createdAt) < time(m.createdAt)) out.push(shown[j++])
+    out.push(m)
+  }
+  return out.concat(shown.slice(j))
+}
+
 function ChatPanel({ peerId }: { peerId: number }) {
   const me = useAuthStore((s) => s.user!)
+  const peer = usePeer(peerId)
   const friend = useFriendStore((s) => s.friends.find((f) => f.id === peerId))
   const friendsLoaded = useFriendStore((s) => s.loaded)
+  const summary = useChatListStore((s) => s.chats[peerId])
   const conv = useChatStore((s) => s.convs[peerId])
+  const locals = useChatStore((s) => s.locals[peerId]) ?? NO_MESSAGES
   const open = useChatStore((s) => s.open)
+  const close = useChatStore((s) => s.close)
   const loadOlder = useChatStore((s) => s.loadOlder)
+  const loadNewer = useChatStore((s) => s.loadNewer)
+  const jumpToUnread = useChatStore((s) => s.jumpToUnread)
+  const jumpToLatest = useChatStore((s) => s.jumpToLatest)
+  const markAllRead = useChatStore((s) => s.markAllRead)
+  const reportSeen = useChatStore((s) => s.reportSeen)
 
   useEffect(() => {
     open(peerId)
-  }, [open, peerId])
+    return () => close(peerId)
+  }, [open, close, peerId])
 
   // 好友列表加载完、对方不在其中：可以查看历史（FR-08 删除好友后记录保留），但不能发消息
   const notFriend = friendsLoaded && !friend
-  const peer = friend ?? { id: peerId, username: `用户 ${peerId}`, avatarUrl: '' }
-  const messages = conv?.messages ?? NO_MESSAGES
+  const messages = useMemo(() => compose(conv, locals), [conv, locals])
 
   const listRef = useRef<HTMLDivElement>(null)
   const stickToBottom = useRef(true) // 用户停留在底部附近时，新消息到来自动滚到底；往上翻看历史时不打扰
-  const prependAnchor = useRef<number | null>(null) // 加载更早的消息前记下内容高度，加载后保持可视位置不跳
+  const [nearBottom, setNearBottom] = useState(true)
+  // 加载更早的消息前记下第一条消息的 DOM 节点和它的位置，加载后按它移动的距离补偿，可视位置不跳。
+  // 不能用"内容总高度的变化"来补偿：等待期间底部也可能追加了消息（向下加载、新推送），会把视图多推下去一截
+  const prepend = useRef<{ node: HTMLElement; top: number; firstKey: string } | null>(null)
 
-  const onScroll = () => {
+  // checkEdges 滚动、内容变化后调用：靠近顶部就加载更早的，靠近底部（且窗口不在最新）就加载更新的（FR-18）。
+  // 内容不满一屏时 scrollTop 为 0，也会触发向上加载，直到填满或没有更早的消息。
+  // 上次加载出错时只在用户主动滚动时重试，否则每次重新渲染都会立刻再请求一次
+  const checkEdges = (byUser: boolean) => {
     const el = listRef.current
-    if (!el) return
-    stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    if (!el || !conv?.ready || conv.loading) return
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+    stickToBottom.current = dist < NEAR_BOTTOM && conv.atLatest
+    setNearBottom(dist < NEAR_BOTTOM)
+    if (conv.error && !byUser) return
+    if (el.scrollTop < EDGE && conv.hasMoreBefore && !conv.loadingOlder) {
+      const node = el.querySelector<HTMLElement>('.msg-wrap')
+      prepend.current = node && messages[0] ? { node, top: node.offsetTop, firstKey: messages[0].key } : null
+      void loadOlder(peerId)
+    }
+    if (dist < EDGE && !conv.atLatest && !conv.loadingNewer) void loadNewer(peerId)
   }
 
   useLayoutEffect(() => {
     const el = listRef.current
     if (!el) return
-    if (prependAnchor.current !== null) {
-      el.scrollTop += el.scrollHeight - prependAnchor.current
-      prependAnchor.current = null
-      return
+    const p = prepend.current
+    if (p && messages[0]?.key !== p.firstKey) {
+      prepend.current = null
+      // 只有原来的第一条还在（说明是在前面插入了更早的消息）才补偿；整个窗口被替换（跳转）时不补偿
+      if (p.node.isConnected && messages.some((m) => m.key === p.firstKey)) {
+        el.scrollTop += p.node.offsetTop - p.top
+        return
+      }
     }
-    const last = messages[messages.length - 1]
-    if (stickToBottom.current || (last?.senderId === me.id && last.status !== 'sent')) {
+    if (stickToBottom.current) el.scrollTop = el.scrollHeight
+  }, [messages])
+
+  // 跳转：滚到第一条 seq >= 目标的消息（它上面就是"以下为新消息"分隔线），或滚到底。放在上一个 effect 之后，覆盖它
+  const scrollTarget = conv?.scrollTarget
+  useLayoutEffect(() => {
+    const el = listRef.current
+    if (!el || !scrollTarget) return
+    if (scrollTarget.kind === 'bottom') {
       el.scrollTop = el.scrollHeight
       stickToBottom.current = true
+      return
     }
-  }, [messages, me.id])
+    const rows = el.querySelectorAll<HTMLElement>('[data-msg-seq]')
+    const row = [...rows].find((r) => Number(r.dataset.msgSeq) >= scrollTarget.seq)
+    if (row) {
+      el.scrollTop = row.offsetTop - 48 // 留出顶部横条的位置
+      stickToBottom.current = false
+    }
+  }, [scrollTarget])
 
-  const onLoadOlder = () => {
-    prependAnchor.current = listRef.current?.scrollHeight ?? null
-    void loadOlder(peerId)
+  useEffect(() => checkEdges(false)) // 每次渲染后检查一次（内容变化、加载完成）
+
+  // 已读（FR-15）：每条已确认消息的底部有一个 1px 的标记，标记进入可视范围 = 这条消息的底边出现在了屏幕上。
+  // 页面在后台（切到别的标签页、最小化）时看不到，不算；回到前台时把当前可见的补报一次
+  const observer = useRef<IntersectionObserver | null>(null)
+  useEffect(() => {
+    const root = listRef.current
+    if (!root) return
+    const inView = new Set<number>()
+    const flush = () => {
+      if (document.visibilityState === 'visible' && inView.size > 0) reportSeen(peerId, [...inView])
+    }
+    const obs = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          const seq = Number((e.target as HTMLElement).dataset.seenSeq)
+          if (e.isIntersecting) inView.add(seq)
+          else inView.delete(seq)
+        }
+        flush()
+      },
+      { root },
+    )
+    observer.current = obs
+    root.querySelectorAll('[data-seen-seq]').forEach((n) => obs.observe(n))
+    document.addEventListener('visibilitychange', flush)
+    return () => {
+      obs.disconnect()
+      observer.current = null
+      document.removeEventListener('visibilitychange', flush)
+    }
+  }, [peerId, reportSeen])
+
+  useLayoutEffect(() => {
+    const root = listRef.current
+    const obs = observer.current
+    if (!root || !obs) return
+    root.querySelectorAll('[data-seen-seq]').forEach((n) => obs.observe(n)) // 重复 observe 同一个元素没有副作用
+  }, [messages])
+
+  // 已读位置或最新 seq 变了（会话列表刚拉下来、其他标签页读了、新消息到了）：用已经看到过的消息重新推进一次
+  useEffect(() => {
+    reportSeen(peerId, [])
+  }, [peerId, reportSeen, summary?.readSeq, summary?.lastSeq, conv?.messages])
+
+  // 打开后稍等一下再决定要不要显示"N 条新消息"横条：未读全在屏幕内时，已读会在第一轮检测后立即推进，横条不会闪一下
+  const [settled, setSettled] = useState(false)
+  useEffect(() => {
+    const t = setTimeout(() => setSettled(true), 300)
+    return () => clearTimeout(t)
+  }, [])
+
+  const unread = unreadOf(summary)
+  const divider = conv?.dividerSeq
+  // 顶部横条：有未读被跳过了——看到过更靠后的消息，第一条未读却没看到（打开时停在最新而未读更早、
+  // 停在底部时一下来很多条、滚动时跳过了一段）。点"跳转"回到第一条未读，或直接"标记为已读"
+  const showTopBar = settled && !!summary && unread > 0 && (conv?.maxSeen ?? 0) > summary.readSeq
+  // 分隔线只在窗口真的包含第一条未读时才画（画在 seq >= 它的第一条上面，第一条未读被删除时也能落到下一条）。
+  // 窗口从更晚的位置开始时（打开停在最新、未读更早），第一条未读不在这里，不能画在窗口第一条上面
+  const dividerKey =
+    divider && conv && conv.winLo <= divider ? messages.find((m) => m.seq !== undefined && m.seq >= divider)?.key : undefined
+  // 底部按钮：不在底部、或窗口不在最新时显示；有没看到的新消息时显示条数
+  const rows = useMemo(() => layoutRows(messages, dividerKey), [messages, dividerKey])
+  const newBelow = summary ? Math.max(0, summary.lastSeq - Math.max(summary.readSeq, conv?.maxSeen ?? 0)) : 0
+  const showBottom = !!conv?.ready && (!conv.atLatest || !nearBottom)
+
+  const toBottom = () => {
+    if (conv?.atLatest) {
+      const el = listRef.current
+      if (el) el.scrollTop = el.scrollHeight
+      stickToBottom.current = true
+    } else {
+      jumpToLatest(peerId)
+    }
+  }
+
+  const onSent = () => {
+    // 发送即已读：窗口不在最新时（正在看更早的消息）先回到最新，刚发出的消息才看得到
+    if (conv && !conv.atLatest) jumpToLatest(peerId)
+    stickToBottom.current = true
   }
 
   return (
     <div className="chat">
       <header className="chat-header">
         <UserAvatar user={peer} size={32} />
-        <div className="chat-header-name">{peer.username}</div>
+        <div className="chat-header-name">{displayName(peer)}</div>
         <div className="chat-header-id">ID {peerId}</div>
+        {/* 占位：功能还没做，先平衡宽屏下的左右视觉重心 */}
+        <div className="chat-header-actions">
+          <ComingSoon title="搜索聊天记录" icon={<SearchOutlined />} />
+          <ComingSoon title="会话信息" icon={<PanelRightIcon />} />
+        </div>
       </header>
 
-      <div className="chat-messages" ref={listRef} onScroll={onScroll}>
-        {conv?.hasMoreBefore && (
-          <div className="chat-more">
-            <Button type="link" size="small" loading={conv.loadingOlder} onClick={onLoadOlder}>
-              查看更早的消息
-            </Button>
+      <div className="chat-body">
+        {showTopBar && (
+          <div className="chat-unread-bar">
+            <span>{unread > 99 ? '99+' : unread} 条新消息</span>
+            <span className="chat-unread-actions">
+              <Button type="link" size="small" onClick={() => void jumpToUnread(peerId)}>
+                跳转
+              </Button>
+              <Button type="text" size="small" onClick={() => markAllRead(peerId)}>
+                标记为已读
+              </Button>
+            </span>
           </div>
         )}
-        {conv?.loading && !conv.loaded && (
-          <div className="chat-more">
+
+        <div className="chat-messages" ref={listRef} onScroll={() => checkEdges(true)}>
+          {/* 限宽居中的消息流。不能设 position，否则消息行的 offsetParent 会变成它，跳转定位会算错 */}
+          <div className="chat-stream">
+            {(conv?.loadingOlder || (conv?.loading && !conv.ready)) && (
+              <div className="chat-more">
+                <Spin size="small" />
+              </div>
+            )}
+            {conv?.error && <Alert type="error" title={conv.error} showIcon style={{ margin: '8px 0' }} />}
+            {conv?.ready && messages.length === 0 && <div className="chat-empty">还没有消息，打个招呼吧</div>}
+
+            {rows.map(({ message: m, timeDivider, pos }) => (
+              <div key={m.key} className="msg-wrap" data-msg-seq={m.seq}>
+                {m.key === dividerKey && (
+                  <div className="chat-divider">
+                    <span>以下为新消息</span>
+                  </div>
+                )}
+                {timeDivider && (
+                  <div className="chat-time">
+                    <span>{formatTime(m.createdAt)}</span>
+                  </div>
+                )}
+                <MessageRow message={m} mine={m.senderId === me.id} pos={pos} peer={peer} />
+                {m.seq !== undefined && <span className="msg-seen" data-seen-seq={m.seq} />}
+              </div>
+            ))}
+
+            {conv?.loadingNewer && (
+              <div className="chat-more">
+                <Spin size="small" />
+              </div>
+            )}
+          </div>
+        </div>
+
+        {conv?.loading && conv.ready && (
+          <div className="chat-loading-mask">
             <Spin />
           </div>
         )}
-        {conv?.error && <Alert type="error" title={conv.error} showIcon style={{ margin: '8px 0' }} />}
-        {conv?.loaded && messages.length === 0 && <div className="chat-empty">还没有消息，打个招呼吧</div>}
 
-        {messages.map((m, i) => (
-          <div key={m.key}>
-            {showTimeDivider(messages[i - 1], m) && <div className="chat-time">{formatTime(m.createdAt)}</div>}
-            <MessageRow message={m} mine={m.senderId === me.id} peer={peer} me={me} />
-          </div>
-        ))}
+        {showBottom && (
+          <Button className="chat-jump-bottom" shape="round" icon={<ArrowDownOutlined />} onClick={toBottom}>
+            {newBelow > 0 ? `${newBelow > 99 ? '99+' : newBelow} 条新消息` : '回到最新'}
+          </Button>
+        )}
       </div>
 
-      {notFriend ? (
-        <div className="chat-disabled">对方不是你的好友，无法发送消息</div>
-      ) : (
-        <Composer peerId={peerId} onSent={() => (stickToBottom.current = true)} />
-      )}
+      <div className="chat-composer-wrap">
+        {notFriend ? (
+          <div className="chat-disabled">对方不是你的好友，无法发送消息</div>
+        ) : (
+          <Composer peerId={peerId} onSent={onSent} />
+        )}
+      </div>
     </div>
   )
+}
+
+// ---------- 连续消息分组 ----------
+//
+// 只根据已有的 senderId、createdAt 在渲染时计算，不改消息的数据结构，也不改 store：
+// 已确认的消息、发送中 / 发送失败的本地消息都有这两个字段，统一处理。
+// 同一发送者、和上一条相隔不超过 GROUP_GAP 的消息归为一组；遇到时间分隔、"以下为新消息"分隔线时强制另起一组，
+// 这样分隔线上下的消息不会被画成连在一起的气泡。
+
+type GroupPos = 'single' | 'first' | 'middle' | 'last'
+
+interface Row {
+  message: ChatMessage
+  timeDivider: boolean // 在这条上面插入时间分隔
+  pos: GroupPos // 在组里的位置：决定是否显示头像、气泡圆角和间距
 }
 
 // 和上一条相隔超过 5 分钟时，插入一条时间分隔
 function showTimeDivider(prev: ChatMessage | undefined, cur: ChatMessage) {
   if (!prev) return true
-  return new Date(cur.createdAt).getTime() - new Date(prev.createdAt).getTime() > 5 * 60_000
+  return time(cur.createdAt) - time(prev.createdAt) > TIME_DIVIDER_GAP
+}
+
+// startsGroup cur 是否要另起一组（和 prev 不能连在一起）
+function startsGroup(prev: ChatMessage | undefined, cur: ChatMessage, dividerKey: string | undefined) {
+  if (!prev || showTimeDivider(prev, cur) || cur.key === dividerKey) return true
+  return prev.senderId !== cur.senderId || time(cur.createdAt) - time(prev.createdAt) > GROUP_GAP
+}
+
+function layoutRows(messages: ChatMessage[], dividerKey: string | undefined): Row[] {
+  return messages.map((m, i) => {
+    const first = startsGroup(messages[i - 1], m, dividerKey)
+    const next = messages[i + 1]
+    const last = !next || startsGroup(m, next, dividerKey)
+    const pos: GroupPos = first ? (last ? 'single' : 'first') : last ? 'last' : 'middle'
+    return { message: m, timeDivider: showTimeDivider(messages[i - 1], m), pos }
+  })
 }
 
 interface RowProps {
   message: ChatMessage
   mine: boolean
-  peer: { id: number; username: string; avatarUrl?: string }
-  me: { id: number; username: string }
+  pos: GroupPos
+  peer: Profile
 }
 
-function MessageRow({ message: m, mine, peer, me }: RowProps) {
+function MessageRow({ message: m, mine, pos, peer }: RowProps) {
   const retry = useChatStore((s) => s.retry)
+  // 只有对方的消息显示头像（组的第一条）；自己的消息靠右、实心气泡已经足够区分，不显示头像
+  const showAvatar = !mine && (pos === 'first' || pos === 'single')
 
   return (
-    <div className={'msg-row' + (mine ? ' mine' : '')}>
-      <UserAvatar user={mine ? me : peer} size={32} />
+    <div className={`msg-row ${pos}` + (mine ? ' mine' : '')}>
+      {/* 组内后面的消息不重复渲染头像，但保留同样宽度的位置，气泡对齐 */}
+      {!mine && <div className="msg-avatar">{showAvatar && <UserAvatar user={peer} size={32} />}</div>}
       <div className="msg-body">
         <div className="msg-line">
+          {/* 消息内容一律按纯文本渲染（NFR-04），React 会自动转义；换行靠 CSS 的 pre-wrap 保留 */}
+          <div className="msg-bubble">{m.content}</div>
           {mine && m.status === 'sending' && (
             <Tooltip title="发送中">
               <LoadingOutlined className="msg-status" />
@@ -241,8 +520,10 @@ function MessageRow({ message: m, mine, peer, me }: RowProps) {
               />
             </Tooltip>
           )}
-          {/* 消息内容一律按纯文本渲染（NFR-04），React 会自动转义；换行靠 CSS 的 pre-wrap 保留 */}
-          <div className="msg-bubble">{m.content}</div>
+          {/* 具体时间默认隐藏，悬停到这一行时淡入 */}
+          <span className="msg-time" title={formatTime(m.createdAt)}>
+            {formatClock(m.createdAt)}
+          </span>
         </div>
         {mine && m.status === 'failed' && m.error && <div className="msg-error">{m.error}</div>}
       </div>
@@ -287,14 +568,42 @@ function Composer({ peerId, onSent }: { peerId: number; onSent: () => void }) {
         variant="borderless"
       />
       <div className="chat-composer-footer">
+        {/* 占位：表情、附件第一阶段不做 */}
+        <div className="chat-composer-tools">
+          <ComingSoon title="表情" icon={<SmileOutlined />} />
+          <ComingSoon title="附件" icon={<PaperClipOutlined />} />
+        </div>
         {/* 接近上限时提示字数；超出也允许点发送，消息会被标记为发送失败（只保存在本地） */}
         <span className={'chat-count' + (tooLong ? ' over' : '')}>
           {len > MAX_MESSAGE_LEN - 100 ? `${len} / ${MAX_MESSAGE_LEN}` : ''}
         </span>
-        <Button type="primary" disabled={!text.trim()} onClick={submit}>
+        {/* 空输入时是禁用态（低饱和），有内容时立即点亮为强调色 */}
+        <Button className="chat-send" type="primary" disabled={!text.trim()} onClick={submit}>
           发送
         </Button>
       </div>
     </div>
+  )
+}
+
+// PanelRightIcon 右侧面板图标（会话信息），线条风格和 antd 的 Outlined 图标一致
+function PanelRightIcon() {
+  return (
+    <span className="anticon" role="img" aria-hidden>
+      <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+        <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />
+        <path d="M14.5 4.5v15" />
+      </svg>
+    </span>
+  )
+}
+
+// ComingSoon 还没实现的功能的占位图标按钮：低存在感，点击只提示
+function ComingSoon({ title, icon }: { title: string; icon: ReactNode }) {
+  const { message } = App.useApp()
+  return (
+    <Tooltip title={title}>
+      <Button type="text" size="small" icon={icon} aria-label={title} onClick={() => message.info(`${title}功能开发中`)} />
+    </Tooltip>
   )
 }

@@ -1,4 +1,5 @@
 import { http } from './client'
+import type { Profile } from './friend'
 
 // 以下类型对应后端 internal/message/handler.go 的 resp 结构体
 
@@ -13,6 +14,16 @@ export interface Message {
   type: 'text'
   content: string
   createdAt: string // UTC
+}
+
+// chatResp：会话列表中的一项（FR-14）
+export interface ChatSummary {
+  peer: Profile
+  lastMessage: Message | null // M5 一定有；M6 删除消息后可能为 null
+  lastSeq: number
+  readSeq: number // 我在这个会话里已读到的 seq（FR-15），只增不减
+  unread: number // = lastSeq - readSeq
+  lastMessageAt: string // UTC，列表按它倒序
 }
 
 export interface MessagePage {
@@ -37,4 +48,14 @@ export function listMessagesAfter(peerId: number, afterSeq: number, limit = 100)
 export function listMessagesBefore(peerId: number, beforeSeq?: number, limit = 30) {
   const q = beforeSeq ? `beforeSeq=${beforeSeq}&` : ''
   return http.get<MessagePage>(`/chats/${peerId}/messages?${q}limit=${limit}`)
+}
+
+// 会话列表：只含有消息的会话，按最后一条消息的时间倒序，不分页
+export function listChats() {
+  return http.get<{ items: ChatSummary[] }>('/chats')
+}
+
+// 上报已读位置。服务端只增不减、不超过最新 seq，返回推进后的 readSeq（可能和传入的不同）
+export function markRead(peerId: number, seq: number) {
+  return http.post<{ readSeq: number }>(`/chats/${peerId}/read`, { seq })
 }

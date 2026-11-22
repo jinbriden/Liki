@@ -18,7 +18,11 @@ Web 端即时通讯软件，个人学习项目（Go 后端 + React 前端 + Post
   - Node 用 WSL 内 nvm 安装的版本（不要用 PATH 里 Windows 的 npm）
   - 开发时 Vite 把 `/api` 代理到 8080，后端不配 CORS
   - 令牌存 localStorage（键 `liki.token`），只通过 `src/stores/auth.ts` 读写；api 层遇到 10003 只清登录状态，由路由守卫负责跳转
-  - UI 风格：黑色系为主，克制扁平；不要赛博朋克元素（霓虹色、发光阴影、渐变、扫描线等）。强调色 `#4f7cff` 只用于主按钮、角标、链接。配色改 `src/theme.ts`，并同步 `src/index.css` 的 `--liki-*` 变量
+  - UI 风格：克制、现代的深色极简风；不要赛博朋克元素（霓虹色、发光阴影、渐变、扫描线等），也不要 QQ / 微信式的厚重布局。配色改 `src/theme.ts` 的 palette，并同步 `src/index.css` 的 `--liki-*` 变量
+    - 三层背景靠明度差区分：导航栏 `#0E1015` < 会话列表 `#14171F` < 聊天画布 `#181B23` < 卡片 / 对方气泡 / 浮层 `#222632`（输入框 `#20242F`）；分割线统一 `rgba(255,255,255,0.06)`
+    - 文字：主 `#ECEFF4`、次级 `#8A93A6`、弱提示 `#5C6475`
+    - 主强调色淡黄 `#F3E38A`（悬停 `#F7EB9F`）配深色字 `#14171F`，只用于核心操作（主按钮、发送按钮、链接）和自己的消息气泡；点缀色只用于极小元素：青色 `#5EEAD4`（在线状态点、导航激活指示条）、粉色 `#F472B6`（未读角标、"以下为新消息"）
+    - 消息流和输入框限宽 920px 居中；同一发送者 3 分钟内的连续消息分组；对方的消息只在组的第一条显示头像，自己的消息不显示头像
 
 ## 代码约定
 
@@ -95,6 +99,11 @@ npm run lint
   - M4 阶段非好友一律不能发消息（40003），FR-12 的"最多一条"放到 M6。
   - 好友实时通知：`friend.request.received`（给被申请方）、`friend.request.handled`（给申请方）、`friend.sync`（给操作者自己的其他连接）。
   - 前端：`src/realtime/socket.ts`（连接、心跳、指数退避重连）、`src/stores/chat.ts`（发送中队列、5 秒未 ACK 重发、30 秒标记失败可重试、seq 不连续时补拉、超长消息只在本地显示为失败）、聊天页。消息暂存内存，IndexedDB 缓存在 M5。
+- M5 会话与历史：已完成并验收（完成标准"清除缓存后重新登录，历史可以按需分页恢复"已用端到端测试验证）。需求见 requirements.md（FR-14～FR-18）：只列有消息的会话 + 临时项；未读 = last_seq − read_seq，read_seq 只增不减，由"实际看到（连续推进）"、"发送即已读"、"标记为已读"三种方式推进，参照 Discord 提供跳转到第一条未读；IndexedDB 按用户分库，主动退出时删除；用"已同步 seq 区间"处理缓存缺口；滚到顶部自动翻页。
+  - 后端已完成（无新迁移）：`GET /api/v1/chats` 返回 `{items: [{peer, lastMessage, lastSeq, readSeq, unread, lastMessageAt}]}`，只含 last_seq > 0 的会话，按 last_message_at 倒序、不分页；`POST /api/v1/chats/:peerId/read {seq}` 返回 `{readSeq}`，用条件 UPDATE 保证只增不减、不超过 last_seq，没聊过返回 0；read_seq 真的变了才推 `chat.read {peerId, readSeq}` 给自己的所有连接（含发起请求的标签页，客户端取较大值），不推给对方。发消息的事务里同时推进发送方 read_seq，不额外推送。消息模块通过自己的 `UserDirectory` 接口用 `*user.Service` 取对方资料。service 单元测试 + `im_test` 库测试覆盖。
+  - 前端已完成并用 Playwright 端到端验证：`src/db/chatCache.ts`（Dexie，库名 `liki-<用户 ID>`）、`src/utils/ranges.ts`（已同步区间）、`src/stores/chatList.ts`（会话列表、未读）、`src/stores/chat.ts`（消息窗口、已读推进、跳转）、`src/stores/session.ts`（主动退出删缓存）、聊天页改为会话列表。验证覆盖：离线未读 → 横条 → 跳转 → 逐步已读、停在底部自动已读、连发多条时被跳过的不算已读、标记为已读、发送即已读、多标签页同步、快照显示、落后 100 条以上的缺口补齐（翻到顶 seq 连续无遗漏、第二次全部读本地）、退出删库后重新登录历史完整恢复。
+  - 顶部"N 条新消息"横条的条件是"未读 > 0 且看到过的最大 seq > readSeq"（有未读被跳过），"跳转"目标是当前 readSeq + 1；"以下为新消息"分隔线固定在打开时的位置，且只在窗口包含它时才画。
+  - 消息区设了 `overflow-anchor: none`：向上翻页的滚动补偿由代码按第一条消息的 DOM 节点位移来做，不能再叠加 Chrome 的自动滚动锚定，否则会多滚一截、中间的消息被跳过而永远不算已读。
 - 待办：登录、注册限流（NFR-05，M6）；连接建立后令牌过期不会主动断开 WebSocket（重连时换票据会失败，届时跳转登录）。
 
 ## 协作方式

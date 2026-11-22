@@ -11,13 +11,19 @@ npm run lint
 
 ## 目录
 
-- `src/theme.ts` + `src/index.css`：黑色系主题。antd 组件用 `theme.ts` 的 token，自定义布局用 `index.css` 的 `--liki-*` 变量，两边配色保持一致
+- `src/theme.ts` + `src/index.css`：深色极简主题（三层背景明度差、淡黄强调色、青 / 粉点缀，规范见根目录 CLAUDE.md）。antd 组件用 `theme.ts` 的 token，自定义布局用 `index.css` 的 `--liki-*` 变量，两边配色保持一致
 - `src/api/`：`client.ts` 封装 fetch，按业务 code 抛出 `ApiError`，遇到 10003 时清除登录状态；`auth.ts`、`friend.ts`、`message.ts`、`ws.ts` 是各模块的接口函数和类型（对应后端 resp 结构体）
 - `src/realtime/socket.ts`：全局唯一的 WebSocket 连接。先调 `/ws/ticket` 换一次性票据再建连；25 秒心跳；断线按 1s、2s、4s…最多 30s 退避重连，网络恢复时立即重连；`socket.on(type, fn)` 订阅推送，`socket.onOpen` 在每次（重）连上时通知各 store 补齐数据。由 `MainLayout` 启动，令牌变化时断开
-- `src/stores/`：Zustand 全局状态。`auth.ts` 是令牌读写的唯一入口（localStorage 键 `liki.token`）；`friend.ts` 存好友、申请列表；`chat.ts` 存各会话的消息和发送中的消息（ACK 超时重发、失败重试、按 seq 合并去重）。令牌变化时都会自动清空
+- `src/stores/`：Zustand 全局状态，令牌变化时都会自动清空
+  - `auth.ts` 是令牌读写的唯一入口（localStorage 键 `liki.token`）；`session.ts` 的 `logout()` 是主动退出：清令牌 + 删本地缓存（令牌过期只清令牌）
+  - `friend.ts` 存好友、申请列表
+  - `chatList.ts` 存会话列表和未读数（`GET /chats` + 推送 + 本地快照，lastSeq / readSeq 只增不减地合并），导航栏总未读也从这里算
+  - `chat.ts` 存各会话正在显示的消息窗口 `[winLo, winHi]`、本地待发送的消息（ACK 超时重发、失败重试）、已读推进（`reportSeen` 连续推进 + 300ms 合并上报）、跳转到第一条未读 / 回到最新
+- `src/db/chatCache.ts`：IndexedDB 本地缓存（Dexie），每个用户一个库 `liki-<用户 ID>`：已确认的消息、已同步的 seq 区间、待发送的消息、会话列表快照。读写失败一律退化为只用内存
+- `src/utils/ranges.ts`：已同步 seq 区间的合并与查找；窗口扩展时区间内读本地，碰到缺口才请求服务端
 - `src/routes/guards.tsx`：`RequireAuth`（需要登录）、`GuestOnly`（仅限未登录）
 - `src/layouts/MainLayout.tsx`：登录后的主框架（左侧导航：聊天 / 好友 / 我的账号）
-- `src/pages/`：页面组件。`friends/` 下是好友页（列表、详情、新的朋友、添加好友弹窗）；`ChatPage.tsx` 是聊天页（左侧好友列表，右侧对话）
+- `src/pages/`：页面组件。`friends/` 下是好友页（列表、详情、新的朋友、添加好友弹窗）；`ChatPage.tsx` 是聊天页（左侧会话列表，右侧对话：滚到顶部 / 底部自动加载，IntersectionObserver 检测消息是否真正被看到，"以下为新消息"分隔线、顶部"N 条新消息"横条、底部"回到最新"按钮）
 - `src/components/UserAvatar.tsx`：默认头像（首字母 + 按用户 ID 固定的底色）
 - `src/utils/`：校验规则、时间格式化
 
@@ -30,4 +36,4 @@ npm run lint
 | `/friends` | 好友页，右侧为空状态 |
 | `/friends/requests` | 新的朋友：收到的申请、我发出的申请 |
 | `/friends/:friendId` | 好友详情 |
-| `/chat`、`/chat/:peerId` | 聊天：与 peerId 的对话。M5 起左侧改为会话列表 |
+| `/chat`、`/chat/:peerId` | 聊天：左侧会话列表，右侧与 peerId 的对话（还没有消息时在列表顶部临时显示一项） |

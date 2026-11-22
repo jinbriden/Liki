@@ -6,8 +6,11 @@ import type { FriendRequest } from '../api/friend'
 import { UserAvatar } from '../components/UserAvatar'
 import { socket } from '../realtime/socket'
 import { useAuthStore } from '../stores/auth'
-import '../stores/chat' // 确保聊天 store 在任何页面都已订阅推送，不在聊天页时收到的消息也不会丢
+// 导入聊天 store 时它就订阅了推送，不在聊天页时收到的消息也不会丢
+import { initChat, useChatStore } from '../stores/chat'
+import { selectTotalUnread, useChatListStore } from '../stores/chatList'
 import { useFriendStore } from '../stores/friend'
+import { logout } from '../stores/session'
 
 // MainLayout 登录后的主框架：左侧导航栏 + 右侧内容区。
 // 好友页和聊天页分开（FR-09），都通过左侧导航切换。
@@ -15,15 +18,17 @@ export default function MainLayout() {
   const userId = useAuthStore((s) => s.user?.id)
   const loadIncoming = useFriendStore((s) => s.loadIncoming)
   const pendingCount = useFriendStore((s) => s.incoming.length)
+  const totalUnread = useChatListStore(selectTotalUnread)
 
   // 进入主框架时拉一次待处理申请，让导航栏"好友"上的角标在任何页面都能显示；之后的新申请靠实时推送
   useEffect(() => {
     loadIncoming().catch(() => {}) // 角标拉取失败不打扰用户，好友页会再拉一次并显示错误
   }, [loadIncoming])
 
-  // 登录后建立 WebSocket 长连接，离开主框架（退出登录）时断开（FR-03）
+  // 登录后打开本地缓存、恢复会话列表，并建立 WebSocket 长连接；离开主框架（退出登录）时断开（FR-03）
   useEffect(() => {
     if (!userId) return
+    void initChat(userId)
     socket.start()
     return () => socket.stop()
   }, [userId])
@@ -33,8 +38,10 @@ export default function MainLayout() {
   return (
     <div className="app-shell">
       <nav className="app-nav">
-        <div className="app-logo">L</div>
-        <NavItem to="/chat" label="聊天" icon={<MessageOutlined />} />
+        <div className="app-logo" aria-label="Liki">
+          <LogoMark />
+        </div>
+        <NavItem to="/chat" label="聊天" icon={<MessageOutlined />} badge={totalUnread} />
         <NavItem to="/friends" label="好友" icon={<TeamOutlined />} badge={pendingCount} />
         <div className="app-nav-spacer" />
         <UserMenu />
@@ -91,7 +98,6 @@ function useFriendNotifications() {
 function UserMenu() {
   // RequireAuth 保证渲染到这里时 user 一定存在
   const user = useAuthStore((s) => s.user)!
-  const clear = useAuthStore((s) => s.clear)
 
   const content = (
     <div style={{ width: 220 }}>
@@ -106,8 +112,8 @@ function UserMenu() {
           </Typography.Text>
         </div>
       </div>
-      {/* 退出登录（FR-03）：只清除本地令牌，服务端没有 logout 接口；令牌清除后 WebSocket 随之断开 */}
-      <Button block icon={<LogoutOutlined />} onClick={clear}>
+      {/* 退出登录（FR-03）：清除本地令牌和本地缓存，服务端没有 logout 接口；令牌清除后 WebSocket 随之断开 */}
+      <Button block icon={<LogoutOutlined />} onClick={() => void logout()}>
         退出登录
       </Button>
     </div>
@@ -115,14 +121,35 @@ function UserMenu() {
 
   return (
     <Popover content={content} trigger="click" placement="rightBottom">
-      <button
-        type="button"
-        aria-label="我的账号"
-        style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', borderRadius: '50%' }}
-      >
-        <UserAvatar user={user} size={36} />
+      <button type="button" aria-label="我的账号" className="app-nav-me">
+        <UserAvatar user={user} size={34} />
+        <PresenceDot />
       </button>
     </Popover>
+  )
+}
+
+// PresenceDot 头像右下角的在线状态点：WebSocket 已连接为青色，连接中 / 断线重连中为灰色
+function PresenceDot() {
+  const connection = useChatStore((s) => s.connection)
+  const online = connection === 'open'
+  return (
+    <Tooltip title={online ? '在线' : '连接中…'} placement="right">
+      <span className={'presence-dot' + (online ? ' online' : '')} />
+    </Tooltip>
+  )
+}
+
+// LogoMark 应用图标：单色线条的对话气泡，跟随文字颜色
+function LogoMark() {
+  return (
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden>
+      <path
+        d="M5 5.5h14a1.5 1.5 0 0 1 1.5 1.5v8.5A1.5 1.5 0 0 1 19 17h-8.2L7 20v-3H5a1.5 1.5 0 0 1-1.5-1.5V7A1.5 1.5 0 0 1 5 5.5Z"
+        strokeLinejoin="round"
+      />
+      <path d="M9 9.5v4h3.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
   )
 }
 
