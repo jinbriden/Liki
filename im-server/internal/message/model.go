@@ -13,7 +13,17 @@ var (
 	ErrInvalidClientMsgID = errors.New("invalid client message id")
 	ErrInvalidPeer        = errors.New("invalid peer user")
 	ErrInvalidReadSeq     = errors.New("invalid read seq")
-	ErrNotFriends         = errors.New("not friends")
+	// ErrStrangerLimit 非好友之间，会话里上一条消息也是自己发的（FR-12：对方回复前只能发一条）。
+	// 由 repository 在分配 seq 的事务里判断后返回，事务回滚、不占用 seq
+	ErrStrangerLimit = errors.New("stranger message limit reached")
+	// ErrInvalidDeleteCount 一次删除的条数不在 1..MaxDeleteBatch 之间（FR-19）
+	ErrInvalidDeleteCount = errors.New("invalid delete count")
+	// ErrInvalidSeq 要删除的消息不存在：seq 不在 1..last_seq 之间，或者根本没有这个会话
+	ErrInvalidSeq = errors.New("invalid message seq")
+	// ErrRateLimited 发消息太频繁（NFR-05）
+	ErrRateLimited = errors.New("send rate limited")
+	// ErrInvalidClearSeq 清空位置为负数，属于客户端代码的 bug
+	ErrInvalidClearSeq = errors.New("invalid clear seq")
 
 	ErrConversationNotFound = errors.New("conversation not found")
 	ErrMessageNotFound      = errors.New("message not found")
@@ -48,6 +58,14 @@ type ConversationMember struct {
 	ConversationID int64 `gorm:"primaryKey;autoIncrement:false"`
 	UserID         int64 `gorm:"primaryKey;autoIncrement:false"`
 	ReadSeq        int64
+	ClearedSeq     int64 // 清空聊天记录的位置，seq <= 它的消息对该成员不可见（FR-19）
+}
+
+// Deletion 删除记录同步（GET /message-deletions）的一项：第几号删除记录、在和谁的会话里、删的是哪个 seq
+type Deletion struct {
+	ID     int64 // message_deletions.id，作为增量同步的游标
+	PeerID int64
+	Seq    int64
 }
 
 // Message 对应 messages 表
@@ -65,12 +83,14 @@ type Message struct {
 	RecipientID int64 `gorm:"-"`
 }
 
-// ConversationSummary 会话列表中的一项在 repository 层的样子：会话本身、我的已读位置、最后一条消息。
-// 由 ListConversations 一次 JOIN 查出来，service 再补上对方的资料。
+// ConversationSummary 会话列表中的一项在 repository 层的样子：会话本身、我的已读和清空位置、我能看到的最后一条消息。
+// 由 ListConversations 一次查出来，service 再补上对方的资料。
+// LastMessage 是排除了我删除、清空的消息之后的最后一条，全部删光时为 nil（FR-14）。
 type ConversationSummary struct {
 	Conversation Conversation
 	ReadSeq      int64
-	LastMessage  Message
+	ClearedSeq   int64
+	LastMessage  *Message
 }
 
 // pairOf 把两个用户 ID 排成 (较小, 较大)，对应 conversations 表的 (user_a, user_b)

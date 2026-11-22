@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"im-server/internal/message"
 	"im-server/internal/pkg/auth"
 	"im-server/internal/pkg/logger"
+	"im-server/internal/pkg/ratelimit"
 	"im-server/internal/pkg/reqctx"
 	"im-server/internal/user"
 )
@@ -32,6 +34,16 @@ const (
 	wsTicketTTL = 30 * time.Second
 	// shutdownTimeout 收到退出信号后，等待进行中的 HTTP 请求完成的最长时间
 	shutdownTimeout = 10 * time.Second
+)
+
+// 限流规则（NFR-05）。令牌桶：平均每 Per 最多 Limit 次，最多一次性突发 Burst 次（不填等于 Limit）
+var (
+	registerPerIP        = ratelimit.Rule{Name: "register_ip", Limit: 10, Per: time.Hour}
+	loginPerIP           = ratelimit.Rule{Name: "login_ip", Limit: 20, Per: time.Minute}
+	loginPerAccount      = ratelimit.Rule{Name: "login_account", Limit: 5, Per: time.Minute} // 防止针对单个账号暴力破解
+	friendRequestPerUser = ratelimit.Rule{Name: "friend_request_user", Limit: 30, Per: time.Hour}
+	wsTicketPerUser      = ratelimit.Rule{Name: "ws_ticket_user", Limit: 30, Per: time.Minute} // 防止客户端重连死循环
+	sendPerUser          = ratelimit.Rule{Name: "send_user", Limit: 5, Per: time.Second, Burst: 10}
 )
 
 func main() {
@@ -75,6 +87,12 @@ func run() error {
 	}
 
 	r := gin.New()
+	// 不信任任何代理：c.ClientIP() 直接取 TCP 连接的对端地址，客户端伪造的 X-Forwarded-For 不起作用，
+	// 否则按 IP 限流可以被轻易绕过（gin 默认信任所有代理）。开发时请求都经过 Vite 代理，IP 都是 127.0.0.1；
+	// 部署到 Nginx 后面时，这里改成信任 Nginx 的地址。
+	if err := r.SetTrustedProxies(nil); err != nil {
+		return err
+	}
 	// 顺序：日志中间件在最外层（生成 request_id，最后记录访问日志），Recovery 在里面（panic 也能被访问日志记到 500）；
 	// reqctx 让写请求不因客户端断开而中途取消（避免"数据库已提交、接口却返回 500、推送被跳过"）
 	r.Use(logger.Middleware(), logger.Recovery(), reqctx.Middleware())
@@ -93,7 +111,8 @@ func run() error {
 	gw := gateway.New(gateway.NewMemoryTicketStore(wsTicketTTL), gateway.NewMemoryPresence())
 
 	userRepo := user.NewRepository(db)
-	userSvc := user.NewService(userRepo, jwtMgr, user.RandomUserID)
+	userSvc := user.NewService(userRepo, jwtMgr, user.RandomUserID,
+		user.WithLoginLimiter(ratelimit.NewMemory(loginPerAccount)))
 	userHandler := user.NewHandler(userSvc)
 
 	friendRepo := friend.NewRepository(db)
@@ -102,16 +121,36 @@ func run() error {
 
 	messageRepo := message.NewRepository(db)
 	// *friend.Service 满足 message.FriendChecker，*user.Service 满足 message.UserDirectory
-	messageSvc := message.NewService(messageRepo, friendSvc, userSvc, message.NewNotifier(gw))
+	messageSvc := message.NewService(messageRepo, friendSvc, userSvc, message.NewNotifier(gw),
+		message.WithSendLimiter(ratelimit.NewMemory(sendPerUser)))
 	messageHandler := message.NewHandler(messageSvc)
 	messageHandler.RegisterPackets(gw)
 
-	api := r.Group("/api/v1")                           // 公开接口
-	protected := api.Group("", auth.Middleware(jwtMgr)) // 需要登录的接口
+	// 限流中间件按"方法 路由模板"挑规则，挂在路由组上，业务模块注册路由时不用关心限流。
+	// 按 IP 的挂在公开接口组；按用户的挂在鉴权之后（这时才知道是谁）。
+	// 中间件要在创建路由组时传入：gin 在注册路由那一刻把组上的中间件拷进路由，之后再 Use 不会生效
+	limit := func(r ratelimit.Rule, key ratelimit.KeyFunc) gin.HandlerFunc {
+		return ratelimit.Middleware(ratelimit.NewMemory(r), r.Name, key)
+	}
+	ipRules := map[string][]gin.HandlerFunc{
+		"POST /api/v1/auth/register": {limit(registerPerIP, ratelimit.ByIP)},
+		"POST /api/v1/auth/login":    {limit(loginPerIP, ratelimit.ByIP)}, // 按账号的限制在 user.Service 里
+	}
+	userRules := map[string][]gin.HandlerFunc{
+		"POST /api/v1/friend-requests": {limit(friendRequestPerUser, ratelimit.ByUser)},
+		"POST /api/v1/ws/ticket":       {limit(wsTicketPerUser, ratelimit.ByUser)},
+	}
+
+	api := r.Group("/api/v1", ratelimit.Routes(ipRules))                             // 公开接口
+	protected := api.Group("", auth.Middleware(jwtMgr), ratelimit.Routes(userRules)) // 需要登录的接口
 	userHandler.RegisterRoutes(api, protected)
 	friendHandler.RegisterRoutes(api, protected)
 	messageHandler.RegisterRoutes(api, protected)
 	gw.RegisterRoutes(api, protected)
+	// 限流规则按路由字符串匹配，路由改名后规则会悄悄失效。启动时核对一遍，对不上就拒绝启动
+	if err := checkRoutes(r, ipRules, userRules); err != nil {
+		return err
+	}
 
 	srv := &http.Server{Addr: listenAddr, Handler: r, ReadHeaderTimeout: 10 * time.Second}
 
@@ -176,4 +215,20 @@ func (l expectedErrorLogger) Trace(ctx context.Context, begin time.Time, fc func
 // LogMode 必须重写，否则 db.Debug() 等调用返回的是内层 logger，会丢掉这层包装
 func (l expectedErrorLogger) LogMode(level gormlogger.LogLevel) gormlogger.Interface {
 	return expectedErrorLogger{l.Interface.LogMode(level)}
+}
+
+// checkRoutes 确认限流规则里的每个"方法 路由"都真的注册了
+func checkRoutes(r *gin.Engine, rules ...map[string][]gin.HandlerFunc) error {
+	registered := map[string]bool{}
+	for _, rt := range r.Routes() {
+		registered[rt.Method+" "+rt.Path] = true
+	}
+	for _, m := range rules {
+		for key := range m {
+			if !registered[key] {
+				return fmt.Errorf("rate limit rule for unknown route %q", key)
+			}
+		}
+	}
+	return nil
 }

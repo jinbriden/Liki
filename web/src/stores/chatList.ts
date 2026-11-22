@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { errorMessage } from '../api/client'
+import type { Profile } from '../api/friend'
 import { listChats, type ChatSummary, type Message } from '../api/message'
 import { loadChatSnapshot, saveChats } from '../db/chatCache'
 import { socket } from '../realtime/socket'
@@ -14,14 +15,19 @@ import { useFriendStore } from './friend'
 //   3. 实时推送：message.new / message.ack 更新最后一条消息，chat.read 更新已读位置。
 // 未读数 = lastSeq - readSeq。自己发消息时服务端会把自己的 readSeq 推进到这条消息（发送即已读），
 // 本地收到自己发的消息时同样推进，所以自己发的消息不会算进未读。
+// clearedSeq（清空位置，FR-19）同样只往前走；chat store 订阅它的变化，删除本地缓存里被清空的消息。
 
 interface ChatListState {
   chats: Record<number, ChatSummary>
   loaded: boolean // 至少从服务端成功拉取过一次
   error: string | null
+  // 还没有会话、也不是好友的人的资料（从搜索结果点"发消息"进来时记下，FR-12）。
+  // 只在内存里，用于临时项和对话框头部显示用户名；发出第一条消息后会话列表会带上资料，以列表为准
+  peers: Record<number, Profile>
 
   load: () => Promise<void>
   loadSnapshot: () => Promise<void>
+  rememberPeer: (p: Profile) => void
 }
 
 export const unreadOf = (c: ChatSummary | undefined) => (c ? Math.max(0, c.lastSeq - c.readSeq) : 0)
@@ -36,7 +42,7 @@ export const selectTotalUnread = (s: ChatListState) => {
 const myId = () => useAuthStore.getState().user?.id ?? 0
 const currentToken = () => useAuthStore.getState().token
 
-// merge 合并同一个会话的两份数据：最后一条消息取 seq 较大的，已读位置取较大的（但不超过最新 seq）
+// merge 合并同一个会话的两份数据：最后一条消息取 seq 较大的（一样大时以 b 为准），已读、清空位置取较大的（但不超过最新 seq）
 function merge(a: ChatSummary | undefined, b: ChatSummary): ChatSummary {
   if (!a) return normalize(b)
   const newer = b.lastSeq >= a.lastSeq ? b : a
@@ -44,12 +50,16 @@ function merge(a: ChatSummary | undefined, b: ChatSummary): ChatSummary {
     ...newer,
     peer: b.peer.username ? b.peer : a.peer, // 推送临时建出来的会话没有用户名，以有的为准
     readSeq: Math.max(a.readSeq, b.readSeq),
+    clearedSeq: Math.max(a.clearedSeq ?? 0, b.clearedSeq ?? 0),
   })
 }
 
 function normalize(c: ChatSummary): ChatSummary {
   const readSeq = Math.min(c.readSeq, c.lastSeq)
-  return { ...c, readSeq, unread: c.lastSeq - readSeq }
+  const clearedSeq = Math.min(c.clearedSeq ?? 0, c.lastSeq)
+  // 摘要里的最后一条已经被清空掉了：不再显示
+  const lastMessage = c.lastMessage && c.lastMessage.seq <= clearedSeq ? null : c.lastMessage
+  return { ...c, readSeq, clearedSeq, lastMessage, unread: c.lastSeq - readSeq }
 }
 
 function put(list: ChatSummary[]) {
@@ -71,6 +81,9 @@ export const useChatListStore = create<ChatListState>()(() => ({
   chats: {},
   loaded: false,
   error: null,
+  peers: {},
+
+  rememberPeer: (p) => useChatListStore.setState((s) => ({ peers: { ...s.peers, [p.id]: p } })),
 
   load: () => {
     if (loading) {
@@ -120,9 +133,10 @@ export function applyMessageToList(m: Message) {
     // 列表里还没有这个会话（第一次聊天，或者列表还没拉下来）：先用手头的信息建一项，再拉一次列表补全资料和准确的已读位置。
     // 对方消息的 readSeq 先按 0 算：列表拉回来后取较大值，以服务端为准
     const f = useFriendStore.getState().friends.find((x) => x.id === peerId)
+    const hint = useChatListStore.getState().peers[peerId]
     put([
       {
-        peer: f ? { id: f.id, username: f.username, avatarUrl: f.avatarUrl } : { id: peerId, username: '', avatarUrl: '' },
+        peer: f ? { id: f.id, username: f.username, avatarUrl: f.avatarUrl } : (hint ?? { id: peerId, username: '', avatarUrl: '' }),
         lastMessage: m,
         lastSeq: m.seq,
         readSeq: mine ? m.seq : 0,
@@ -153,6 +167,21 @@ export function applyReadToList(peerId: number, readSeq: number) {
   put([{ ...cur, readSeq }])
 }
 
+// applyDeletionToList 我删除了若干条消息（FR-19）：摘要正好是其中一条时，先清掉摘要，再从服务端拉列表取"能看到的最后一条"
+export function applyDeletionToList(peerId: number, seqs: number[]) {
+  const cur = useChatListStore.getState().chats[peerId]
+  if (!cur?.lastMessage || !seqs.includes(cur.lastMessage.seq)) return
+  put([{ ...cur, lastMessage: null }])
+  void useChatListStore.getState().load()
+}
+
+// applyClearToList 清空聊天记录推进了清空位置和已读位置（FR-19：清空视为已读）
+export function applyClearToList(peerId: number, clearedSeq: number, readSeq: number) {
+  const cur = useChatListStore.getState().chats[peerId]
+  if (!cur) return
+  put([{ ...cur, clearedSeq: Math.max(cur.clearedSeq ?? 0, clearedSeq), readSeq: Math.max(cur.readSeq, readSeq) }])
+}
+
 // 自己在其他标签页 / 设备上读了消息（FR-04、FR-15）
 socket.on('chat.read', (data) => {
   const d = data as { peerId: number; readSeq: number }
@@ -163,5 +192,5 @@ socket.on('chat.read', (data) => {
 useAuthStore.subscribe((state, prev) => {
   if (state.token === prev.token) return
   reloadAfter = false
-  useChatListStore.setState({ chats: {}, loaded: false, error: null })
+  useChatListStore.setState({ chats: {}, loaded: false, error: null, peers: {} })
 })

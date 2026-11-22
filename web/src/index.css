@@ -533,7 +533,33 @@ body {
 .chat-header-actions {
   margin-left: auto;
   display: flex;
+  align-items: center;
   gap: 2px;
+}
+
+/* 非好友标记（FR-12）：和 ID 标签同样的细边框小标签，不用点缀色，只是说明状态 */
+.chat-header-tag {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--liki-text-3);
+}
+
+/* 头部的文字按钮（添加好友）：比图标按钮的字号小，和右侧图标留出间距 */
+.chat-header-actions .ant-btn.chat-header-text-btn {
+  margin-right: 6px;
+  font-size: 13px;
+}
+
+.chat-add-friend {
+  width: 280px;
+}
+
+.chat-add-friend .compose-actions {
+  margin-top: 12px;
 }
 
 .chat-header-actions .ant-btn {
@@ -783,6 +809,49 @@ body {
   opacity: 1;
 }
 
+/* 消息的操作菜单按钮（删除、多选）：和时间一样默认隐藏，悬停到这一行、或菜单展开时显示 */
+.msg-row .msg-more.ant-btn {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  margin-bottom: 2px;
+  color: var(--liki-text-3);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.msg-row:hover .msg-more.ant-btn,
+.msg-row .msg-more.ant-btn.ant-dropdown-open {
+  opacity: 1;
+}
+
+.msg-row .msg-more.ant-btn:hover {
+  color: var(--liki-text);
+}
+
+/* 多选模式：勾选框固定在最左侧（自己的消息也是），整行可点击，选中的行轻微提亮 */
+.msg-row.selecting {
+  cursor: pointer;
+  border-radius: 8px;
+  padding: 2px 6px;
+  margin-left: -6px;
+  margin-right: -6px;
+}
+
+.msg-row.selecting:hover,
+.msg-row.selected {
+  background: var(--liki-hover);
+}
+
+.msg-check {
+  flex-shrink: 0;
+  align-self: center;
+}
+
+.msg-row.mine .msg-check {
+  margin-right: auto;
+}
+
 .msg-status {
   flex-shrink: 0;
   padding-bottom: 6px;
@@ -882,6 +951,35 @@ body {
 .chat-send.ant-btn:disabled {
   border-color: transparent;
   background: rgba(255, 255, 255, 0.06);
+  color: var(--liki-text-3);
+}
+
+/* 多选删除时代替输入框的操作条（FR-19） */
+.chat-select-bar {
+  max-width: calc(var(--liki-stream-width) - 48px);
+  margin: 0 auto;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--liki-border);
+  border-radius: 14px;
+  background: var(--liki-input);
+}
+
+.chat-select-count {
+  margin-right: auto;
+  font-size: 13px;
+  color: var(--liki-text-2);
+}
+
+/* 非好友时输入框上方的一行说明（FR-12） */
+.chat-stranger-hint {
+  max-width: calc(var(--liki-stream-width) - 48px);
+  margin: 0 auto 6px;
+  padding: 0 4px;
+  font-size: 12px;
   color: var(--liki-text-3);
 }
 

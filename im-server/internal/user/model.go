@@ -11,7 +11,9 @@ var (
 	ErrInvalidPassword = errors.New("invalid password")
 	// ErrInvalidCredentials 登录失败。用户不存在和密码错误都返回它，不让调用方区分。
 	ErrInvalidCredentials = errors.New("invalid user id or password")
-	ErrUserNotFound       = errors.New("user not found")
+	// ErrTooManyAttempts 同一个账号的登录尝试太频繁（NFR-05：防止针对单个账号暴力破解密码）
+	ErrTooManyAttempts = errors.New("too many login attempts")
+	ErrUserNotFound    = errors.New("user not found")
 	// ErrDuplicateID 插入时用户 ID 与已有账号冲突，service 会换一个 ID 重试
 	ErrDuplicateID = errors.New("duplicate user id")
 )

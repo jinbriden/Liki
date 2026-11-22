@@ -3,3 +3,6 @@ logs/
 .env
 node_modules/
 *:Zone.Identifier
+
+# 本地测试账号凭据（不得提交）
+.liki-test.env

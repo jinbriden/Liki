@@ -49,14 +49,35 @@ type TokenIssuer interface {
 	Issue(userID int64) (token string, expiresAt time.Time, err error)
 }
 
+// Limiter 限流器，由 ratelimit 包的实现满足。按 Go 的习惯由使用方定义接口，user 模块不依赖具体实现
+type Limiter interface {
+	Allow(ctx context.Context, key string) bool
+}
+
 type Service struct {
 	repo   Repository
 	tokens TokenIssuer
 	newID  IDGenerator
+	// loginLimit 按目标账号限制登录尝试（NFR-05）。nil 表示不限制（单元测试默认如此）。
+	// 按 IP 的限制在 HTTP 中间件里做；按账号的只能放在这里：要解析请求体才知道登录的是哪个账号
+	loginLimit Limiter
 }
 
-func NewService(repo Repository, tokens TokenIssuer, newID IDGenerator) *Service {
-	return &Service{repo: repo, tokens: tokens, newID: newID}
+// Option 可选配置。用"函数式选项"而不是加构造参数：不需要它的调用方（测试）不用改，
+// 作用类似 Java 里 builder 的可选 setter
+type Option func(*Service)
+
+// WithLoginLimiter 按目标用户 ID 限制登录尝试次数
+func WithLoginLimiter(l Limiter) Option {
+	return func(s *Service) { s.loginLimit = l }
+}
+
+func NewService(repo Repository, tokens TokenIssuer, newID IDGenerator, opts ...Option) *Service {
+	s := &Service{repo: repo, tokens: tokens, newID: newID}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Register 注册新用户。用户名允许重复，按用户输入原样保存；账号由随机生成的 ID 唯一标识。
@@ -117,6 +138,12 @@ func (s *Service) Login(ctx context.Context, userID int64, password string) (*Lo
 	if userID < minUserID || userID > maxUserID || password == "" || len(password) > maxPasswordLen {
 		slog.InfoContext(ctx, "login rejected", "login_user_id", userID, "reason", "malformed")
 		return nil, ErrInvalidCredentials
+	}
+
+	// 每次尝试都计数（不管成功与否、账号存不存在），放在查库和 bcrypt 之前：被限流的请求不消耗服务端算力
+	if s.loginLimit != nil && !s.loginLimit.Allow(ctx, strconv.FormatInt(userID, 10)) {
+		slog.WarnContext(ctx, "login rejected", "login_user_id", userID, "reason", "too_many_attempts")
+		return nil, ErrTooManyAttempts
 	}
 
 	u, err := s.repo.FindByID(ctx, userID)

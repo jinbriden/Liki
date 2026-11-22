@@ -1,13 +1,15 @@
-import { App, Button, Empty, Input, Modal, Spin } from 'antd'
+import { MessageOutlined } from '@ant-design/icons'
+import { App, Button, Empty, Input, Modal, Spin, Tooltip } from 'antd'
 import { useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from 'react-router'
 import { MAX_REQUEST_MESSAGE_LEN, searchUsers, type Relation, type SearchItem } from '../../api/friend'
 import { Code, errorMessage, isApiError } from '../../api/client'
 import { UserAvatar } from '../../components/UserAvatar'
 import { useAuthStore } from '../../stores/auth'
+import { useChatListStore } from '../../stores/chatList'
 import { useFriendStore } from '../../stores/friend'
 
-// AddFriendModal 搜索用户并发送好友申请（FR-05、FR-06）
+// AddFriendModal 搜索用户并发送好友申请（FR-05、FR-06），也可以直接给对方发消息（FR-12：非好友在对方回复前只能发一条）
 export default function AddFriendModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   return (
     // destroyOnHidden：关闭后卸载内容，下次打开时搜索框和结果都是空的
@@ -98,6 +100,7 @@ function ResultItem({ user, composing, onCompose, onCancelCompose, onRelationCha
   const navigate = useNavigate()
   const me = useAuthStore((s) => s.user)!
   const send = useFriendStore((s) => s.send)
+  const rememberPeer = useChatListStore((s) => s.rememberPeer)
   const { message } = App.useApp()
   const [note, setNote] = useState(`我是 ${me.username}`)
   const [sending, setSending] = useState(false)
@@ -122,6 +125,12 @@ function ResultItem({ user, composing, onCompose, onCancelCompose, onRelationCha
   const goto = (path: string) => {
     navigate(path)
     onClose()
+  }
+
+  // 非好友还没有会话时，聊天页拿不到对方资料，先记下来，对话框头部和临时项才能显示用户名
+  const openChat = () => {
+    rememberPeer({ id: user.id, username: user.username, avatarUrl: user.avatarUrl })
+    goto(`/chat/${user.id}`)
   }
 
   let action: ReactNode
@@ -178,7 +187,12 @@ function ResultItem({ user, composing, onCompose, onCancelCompose, onRelationCha
           </div>
         )}
       </div>
-      {action && <div className="card-item-actions">{action}</div>}
+      <div className="card-item-actions">
+        <Tooltip title="发消息">
+          <Button icon={<MessageOutlined />} aria-label="发消息" onClick={openChat} />
+        </Tooltip>
+        {action}
+      </div>
     </div>
   )
 }

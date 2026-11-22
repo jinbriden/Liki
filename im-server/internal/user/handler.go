@@ -62,6 +62,7 @@ const (
 	msgInvalidUsername    = "用户名需为 3-32 位英文字母或数字"
 	msgInvalidPassword    = "密码需为 8-24 位，至少包含一个大写字母、一个小写字母和一个数字，只能使用英文字母、数字和英文符号"
 	msgInvalidCredentials = "用户 ID 或密码错误"
+	msgTooManyAttempts    = "登录尝试太频繁，请稍后再试"
 	msgUnauthorized       = "未登录或登录已过期"
 	msgInternal           = "服务器内部错误"
 )
@@ -103,6 +104,9 @@ func (h *Handler) login(c *gin.Context) {
 	switch {
 	case errors.Is(err, ErrInvalidCredentials):
 		response.Fail(c, http.StatusUnauthorized, response.CodeInvalidCredentials, msgInvalidCredentials)
+		return
+	case errors.Is(err, ErrTooManyAttempts):
+		response.Fail(c, http.StatusTooManyRequests, response.CodeTooManyRequests, msgTooManyAttempts)
 		return
 	case err != nil:
 		slog.ErrorContext(c.Request.Context(), "login failed", "login_user_id", req.UserID, "err", err) // 不记录密码和令牌

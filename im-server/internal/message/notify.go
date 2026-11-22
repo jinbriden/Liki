@@ -39,3 +39,26 @@ type readData struct {
 func (n pushNotifier) ReadUpdated(ctx context.Context, userID, peerID, readSeq int64) {
 	n.pusher.Push(ctx, userID, TypeRead, readData{PeerID: peerID, ReadSeq: readSeq})
 }
+
+// deletedData message.deleted 的内容：和 peerId 的会话里这些 seq 的消息被我删除了
+type deletedData struct {
+	PeerID int64   `json:"peerId"`
+	Seqs   []int64 `json:"seqs"`
+}
+
+// MessagesDeleted 推给自己的所有连接（FR-19 多设备同步）。不推给对方：删除只对自己生效
+func (n pushNotifier) MessagesDeleted(ctx context.Context, userID, peerID int64, seqs []int64) {
+	n.pusher.Push(ctx, userID, TypeDeleted, deletedData{PeerID: peerID, Seqs: seqs})
+}
+
+// clearedData chat.cleared 的内容：清空位置，以及随之推进的已读位置（清空视为已读）
+type clearedData struct {
+	PeerID     int64 `json:"peerId"`
+	ClearedSeq int64 `json:"clearedSeq"`
+	ReadSeq    int64 `json:"readSeq"`
+}
+
+// ChatCleared 推给自己的所有连接（FR-19 多设备同步）。不推给对方
+func (n pushNotifier) ChatCleared(ctx context.Context, userID, peerID, clearedSeq, readSeq int64) {
+	n.pusher.Push(ctx, userID, TypeCleared, clearedData{PeerID: peerID, ClearedSeq: clearedSeq, ReadSeq: readSeq})
+}

@@ -6,6 +6,7 @@ export const Code = {
   InvalidParam: 10001, // 参数不符合业务规则，msg 可以直接展示给用户
   BadRequest: 10002, // 请求体无法解析，属于前端代码 bug
   Unauthorized: 10003, // 令牌缺失/无效/过期：清除令牌并跳转登录页
+  TooManyRequests: 10004, // 请求太频繁被限流（HTTP 429），msg 可以直接展示，稍后重试即可
   InvalidCredentials: 20001, // 登录失败：同为 HTTP 401，但不跳转
   // 好友模块
   CannotAddSelf: 30001,
@@ -17,7 +18,8 @@ export const Code = {
   // 消息模块
   MessageEmpty: 40001,
   MessageTooLong: 40002, // 超过 1500 字：消息标记为发送失败，只保留在本地
-  NotFriends: 40003, // 对方不是好友，不能发消息
+  // 40003 已废弃（M4、M5 阶段的"非好友一律不能发"）
+  StrangerLimit: 40004, // 非好友之间，对方回复或成为好友前只能发一条消息（FR-12）
   Internal: 50000,
   // 以下为前端自定义，不会出现在后端响应里
   Network: -1, // 请求没发出去或没收到响应

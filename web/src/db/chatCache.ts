@@ -31,11 +31,20 @@ export interface StoredChat extends ChatSummary {
   peerId: number
 }
 
+// 零散的键值，目前只有删除记录同步的游标（FR-20）
+interface StoredMeta {
+  key: string
+  value: number
+}
+
+const DELETION_CURSOR = 'deletionCursor'
+
 class ChatDB extends Dexie {
   messages!: Table<StoredMessage, [number, number]>
   outbox!: Table<StoredLocal, string>
   ranges!: Table<StoredRanges, number>
   chats!: Table<StoredChat, number>
+  meta!: Table<StoredMeta, string>
 
   constructor(name: string) {
     super(name)
@@ -46,6 +55,8 @@ class ChatDB extends Dexie {
       ranges: 'peerId',
       chats: 'peerId',
     })
+    // M6：加一张键值表存删除记录的同步游标。只新增表，已有数据不需要迁移
+    this.version(2).stores({ meta: 'key' })
   }
 }
 
@@ -124,6 +135,40 @@ export function readMessages(peerId: number, lo: number, hi: number, limit: numb
     const list = await q.limit(limit).toArray()
     return from === 'end' ? list.reverse() : list
   })
+}
+
+// ---------- 删除（FR-19、FR-20） ----------
+// 删除只删消息本身，已同步区间保持不变：区间表示"这段和服务端对齐过"，区间里缺的 seq 就是被删除的，
+// 不会被当成缺口再去服务端拉（见 utils/ranges.ts）。
+
+// deleteMessages 删除本地缓存里的若干条消息
+export function deleteMessages(peerId: number, seqs: number[]) {
+  return safe(undefined, (d) => d.messages.bulkDelete(seqs.map((seq) => [peerId, seq] as [number, number])))
+}
+
+// clearMessages 清空：删除 seq <= clearedSeq 的消息，并把 [1, clearedSeq] 记为已同步（这段里本来就什么都没有了）
+export function clearMessages(peerId: number, clearedSeq: number) {
+  return safe(undefined, (d) =>
+    d.transaction('rw', d.messages, d.ranges, async () => {
+      await d.messages.where('[peerId+seq]').between([peerId, 1], [peerId, clearedSeq], true, true).delete()
+      const cur = (await d.ranges.get(peerId))?.ranges ?? []
+      await d.ranges.put({ peerId, ranges: addRange(cur, 1, clearedSeq) })
+    }),
+  )
+}
+
+export function loadDeletionCursor() {
+  return safe(0, async (d) => (await d.meta.get(DELETION_CURSOR))?.value ?? 0)
+}
+
+// saveDeletionCursor 只往前推：多个标签页同时同步时，以走得最远的为准
+export function saveDeletionCursor(cursor: number) {
+  return safe(undefined, (d) =>
+    d.transaction('rw', d.meta, async () => {
+      const cur = (await d.meta.get(DELETION_CURSOR))?.value ?? 0
+      if (cursor > cur) await d.meta.put({ key: DELETION_CURSOR, value: cursor })
+    }),
+  )
 }
 
 // ---------- 待发送 ----------

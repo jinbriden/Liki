@@ -1,6 +1,9 @@
 import { create } from 'zustand'
 import { Code, errorMessage } from '../api/client'
 import {
+  clearChat as apiClearChat,
+  deleteMessages as apiDeleteMessages,
+  listDeletions,
   listMessagesAfter,
   listMessagesBefore,
   markRead,
@@ -13,7 +16,8 @@ import * as cache from '../db/chatCache'
 import { socket, type SocketStatus } from '../realtime/socket'
 import { findRange, topRange, type Range } from '../utils/ranges'
 import { useAuthStore } from './auth'
-import { applyMessageToList, applyReadToList, useChatListStore } from './chatList'
+import { applyClearToList, applyDeletionToList, applyMessageToList, applyReadToList, useChatListStore } from './chatList'
+import { useFriendStore } from './friend'
 import type { ChatMessage } from './chatTypes'
 
 export type { ChatMessage, MessageStatus } from './chatTypes'
@@ -38,6 +42,12 @@ export type { ChatMessage, MessageStatus } from './chatTypes'
 // ---------- 已读（FR-15） ----------
 // 页面（ChatPanel）用 IntersectionObserver 报告"哪些消息的底边出现在了可视范围内"（reportSeen），
 // 这里从当前 readSeq 往后连续推进：碰到第一条没看到的对方消息就停下，自己的消息直接跳过。
+//
+// ---------- 删除（FR-19、FR-20） ----------
+// 删除、清空都先请求服务端，成功后再从窗口和本地缓存里去掉；同一账号的其他标签页、设备靠推送（在线）
+// 或登录、重连时的同步（离线期间的删除按游标拉取，清空看会话列表里的 clearedSeq）做同样的处理。
+// 被删除的 seq 留在已同步区间里，不会被当成缺口；本次运行中删掉的 seq 记在内存里，
+// 和删除同时进行的加载如果带回了它们，写入窗口和缓存前会被过滤掉。
 
 export type ScrollTarget = { kind: 'seq'; seq: number; nonce: number } | { kind: 'bottom'; nonce: number }
 
@@ -76,6 +86,7 @@ const FAIL_AFTER = 30_000
 
 export const TOO_LONG_ERROR = '消息过长，请重新发送'
 const SEND_FAILED_ERROR = '发送失败，点击重试'
+const RATE_LIMITED_ERROR = '发送太频繁，点击重试'
 
 interface ChatState {
   convs: Record<number, Conversation>
@@ -92,6 +103,10 @@ interface ChatState {
   reportSeen: (peerId: number, seqs: number[]) => void
   send: (peerId: number, text: string) => SendResult
   retry: (peerId: number, key: string) => void
+  // deleteMessages 删除选中的消息（按 ChatMessage.key）：已确认的请求服务端删除，发送失败 / 超长的只删本地。失败时抛出错误
+  deleteMessages: (peerId: number, keys: string[]) => Promise<void>
+  // clearChat 清空聊天记录到当前已知的最新 seq（同时视为已读），并丢掉本地发送失败的消息。失败时抛出错误
+  clearChat: (peerId: number) => Promise<void>
 }
 
 const emptyConv = (peerId: number): Conversation => ({
@@ -119,6 +134,8 @@ const getConv = (peerId: number) => useChatStore.getState().convs[peerId] as Con
 const summaryOf = (peerId: number) => useChatListStore.getState().chats[peerId]
 // latestSeq 已知的会话最新 seq（来自会话列表，推送会实时更新它）
 const latestSeq = (peerId: number) => summaryOf(peerId)?.lastSeq ?? 0
+// clearedOf 清空位置：seq <= 它的消息已经看不到了，窗口往前翻到它就到头
+const clearedOf = (peerId: number) => summaryOf(peerId)?.clearedSeq ?? 0
 
 // peerOf 消息属于和谁的会话：我发的看接收方，别人发的看发送方
 const peerOf = (m: Message) => (m.senderId === myId() ? m.recipientId : m.senderId)
@@ -141,18 +158,41 @@ function fromServer(m: Message): ChatMessage {
 }
 
 // 一页服务端结果覆盖了哪段 seq（用于记录已同步区间）。
-// 向前翻页（beforeSeq）：hasMore 时从这一页第一条开始，否则一直到 1；不带 beforeSeq 的最新一页到最后一条为止
+// 向前翻页（beforeSeq）：hasMore 时从这一页第一条开始，否则一直到 1；
+// 不带 beforeSeq 的最新一页一直到查询时的 lastSeq（最后几条被删除时，最后一条消息的 seq 比 lastSeq 小）
 function coveredBefore(page: MessagePage, beforeSeq?: number): Range | null {
   if (page.hasMore && page.items.length === 0) return null // 不应出现；出现了也不能据此把区间记到 1
   const lo = page.hasMore ? page.items[0].seq : 1
-  const hi = beforeSeq !== undefined ? beforeSeq - 1 : (page.items.at(-1)?.seq ?? 0)
+  const hi = beforeSeq !== undefined ? beforeSeq - 1 : Math.max(page.lastSeq ?? 0, page.items.at(-1)?.seq ?? 0)
   return lo <= hi ? [lo, hi] : null
 }
 
-// 向后同步（afterSeq）：从 afterSeq + 1 到这一页最后一条
+// 向后同步（afterSeq）：从 afterSeq + 1 到这一页最后一条；没有更多时一直到查询时的 lastSeq
 function coveredAfter(page: MessagePage, afterSeq: number): Range | null {
-  const hi = page.items.at(-1)?.seq ?? afterSeq
+  let hi = page.items.at(-1)?.seq ?? afterSeq
+  if (!page.hasMore) hi = Math.max(hi, page.lastSeq ?? 0)
   return afterSeq + 1 <= hi ? [afterSeq + 1, hi] : null
+}
+
+// 本次运行中删除过的 seq（peerId → seq 集合），以及 hide：去掉已删除、已清空的消息。
+// 服务端返回的结果本来就不含它们，这里防的是"请求发出后、结果回来前刚好删除了"的情况
+const deletedSeqs = new Map<number, Set<number>>()
+
+function hide<T extends { seq?: number }>(peerId: number, msgs: T[]): T[] {
+  const cleared = clearedOf(peerId)
+  const del = deletedSeqs.get(peerId)
+  if (cleared === 0 && !del) return msgs
+  return msgs.filter((m) => m.seq === undefined || (m.seq > cleared && !del?.has(m.seq)))
+}
+
+async function fetchBefore(peerId: number, beforeSeq: number | undefined, limit: number) {
+  const page = await listMessagesBefore(peerId, beforeSeq, limit)
+  return { ...page, items: hide(peerId, page.items) }
+}
+
+async function fetchAfter(peerId: number, afterSeq: number, limit: number) {
+  const page = await listMessagesAfter(peerId, afterSeq, limit)
+  return { ...page, items: hide(peerId, page.items) }
 }
 
 function newClientMsgId(): string {
@@ -190,7 +230,7 @@ export const useChatStore = create<ChatState>()((_set, get) => ({
       // 只在内存里留最新一页，避免来回翻看之后窗口越来越大；更早的消息还在 IndexedDB 里
       if (c.messages.length > PAGE) {
         const msgs = c.messages.slice(-PAGE)
-        return { ...next, messages: msgs, winLo: msgs[0].seq!, hasMoreBefore: msgs[0].seq! > 1 }
+        return { ...next, messages: msgs, winLo: msgs[0].seq!, hasMoreBefore: msgs[0].seq! > clearedOf(peerId) + 1 }
       }
       return next
     })
@@ -213,7 +253,7 @@ export const useChatStore = create<ChatState>()((_set, get) => ({
         return
       }
       // 到了缺口或本地范围之外：向服务端拉
-      const page = await listMessagesBefore(peerId, lo, PAGE)
+      const page = await fetchBefore(peerId, lo, PAGE)
       if (!alive()) return
       const cov = coveredBefore(page, lo)
       if (cov) await cache.saveMessages(peerId, page.items, cov)
@@ -246,7 +286,7 @@ export const useChatStore = create<ChatState>()((_set, get) => ({
         }
         return
       }
-      const page = await listMessagesAfter(peerId, hi, PAGE)
+      const page = await fetchAfter(peerId, hi, PAGE)
       if (!alive()) return
       const cov = coveredAfter(page, hi)
       if (cov) await cache.saveMessages(peerId, page.items, cov)
@@ -289,7 +329,7 @@ export const useChatStore = create<ChatState>()((_set, get) => ({
         if (atLatest) void syncAfter(peerId)
         return
       }
-      const page = await listMessagesAfter(peerId, start - 1, PAGE)
+      const page = await fetchAfter(peerId, start - 1, PAGE)
       if (!alive()) return
       const cov = coveredAfter(page, start - 1)
       if (cov) await cache.saveMessages(peerId, page.items, cov)
@@ -379,6 +419,33 @@ export const useChatStore = create<ChatState>()((_set, get) => ({
     updateLocal(peerId, key, (x) => ({ ...x, status: 'sending', error: undefined, retryable: undefined }))
     startPending(m.clientMsgId, peerId) // 同一个 clientMsgId：如果其实已经写库了，服务端会直接返回已有的那条
   },
+
+  deleteMessages: async (peerId, keys) => {
+    const picked = new Set(keys)
+    const seqs = (getConv(peerId)?.messages ?? []).filter((m) => picked.has(m.key)).map((m) => m.seq!)
+    // "发送中"的不能删（可能马上就写库了）；发送失败、超长的只在本地，直接丢掉
+    const localKeys = (get().locals[peerId] ?? []).filter((m) => picked.has(m.key) && m.status === 'failed').map((m) => m.key)
+    const token = currentToken()
+    if (seqs.length > 0) {
+      await apiDeleteMessages(peerId, seqs) // 先删服务端：失败时本地什么也不动
+      if (currentToken() !== token) return
+      applyDeletion(peerId, seqs) // 推送也会来一次，重复处理没有影响
+    }
+    removeLocals(peerId, localKeys)
+  },
+
+  clearChat: async (peerId) => {
+    const c = getConv(peerId)
+    // 清空到"此刻已知的最新 seq"：之后才到的消息不受影响（FR-19）
+    const upTo = Math.max(latestSeq(peerId), c?.winHi ?? 0)
+    const token = currentToken()
+    if (upTo > 0) {
+      const res = await apiClearChat(peerId, upTo)
+      if (currentToken() !== token) return
+      applyClearToList(peerId, res.clearedSeq, res.readSeq) // 会话列表的清空位置变了，订阅里会清理窗口和缓存
+    }
+    removeLocals(peerId, (get().locals[peerId] ?? []).filter((m) => m.status === 'failed').map((m) => m.key))
+  },
 }))
 
 // initChat 登录后（主框架挂载时）调用：打开本地缓存，恢复会话列表快照和待发送的消息，再从服务端拉会话列表
@@ -411,6 +478,7 @@ export async function initChat(userId: number) {
     return { locals }
   })
   void useChatListStore.getState().load()
+  void syncDeletions()
 }
 
 // ---------- 内部工具：只在本文件里使用，页面通过上面的 action 调用 ----------
@@ -448,11 +516,11 @@ function setWindow(
 ) {
   updateConv(peerId, (c) => ({
     ...c,
-    messages: msgs.map(fromServer),
+    messages: hide(peerId, msgs).map(fromServer),
     winLo: lo,
     winHi: hi,
     atLatest,
-    hasMoreBefore: lo > 1,
+    hasMoreBefore: lo > clearedOf(peerId) + 1,
     ready: true,
     loading: false,
     loadingOlder: false,
@@ -466,7 +534,7 @@ function setWindow(
 // appendWindow 在窗口末尾接上更新的消息（seq 都大于 winHi），hi 是这批消息覆盖到的 seq
 function appendWindow(peerId: number, msgs: Message[], hi?: number) {
   updateConv(peerId, (c) => {
-    const fresh = msgs.filter((m) => m.seq > c.winHi).map(fromServer)
+    const fresh = hide(peerId, msgs.filter((m) => m.seq > c.winHi)).map(fromServer)
     const winHi = Math.max(c.winHi, hi ?? 0, fresh.at(-1)?.seq ?? 0)
     if (fresh.length === 0 && winHi === c.winHi) return c
     return { ...c, messages: [...c.messages, ...fresh], winHi }
@@ -477,9 +545,9 @@ function appendWindow(peerId: number, msgs: Message[], hi?: number) {
 // prependWindow 在窗口前面接上更早的消息（seq 都小于 winLo），lo 是这批消息覆盖到的 seq
 function prependWindow(peerId: number, msgs: Message[], lo: number) {
   updateConv(peerId, (c) => {
-    const older = msgs.filter((m) => m.seq < c.winLo).map(fromServer)
+    const older = hide(peerId, msgs.filter((m) => m.seq < c.winLo)).map(fromServer)
     const winLo = Math.min(c.winLo, lo)
-    return { ...c, messages: [...older, ...c.messages], winLo, hasMoreBefore: winLo > 1 }
+    return { ...c, messages: [...older, ...c.messages], winLo, hasMoreBefore: winLo > clearedOf(peerId) + 1 }
   })
   confirmLocals(peerId, msgs)
 }
@@ -504,7 +572,7 @@ async function showLatest(peerId: number) {
 async function loadLatestFromServer(peerId: number, alive: () => boolean, scrollTarget: ScrollTarget | null) {
   updateConv(peerId, (c) => ({ ...c, loading: true, error: null }))
   try {
-    const page = await listMessagesBefore(peerId, undefined, PAGE) // 只加载最近一页（FR-18）
+    const page = await fetchBefore(peerId, undefined, PAGE) // 只加载最近一页（FR-18）
     if (!alive()) return
     const cov = coveredBefore(page)
     if (cov || page.items.length > 0) await cache.saveMessages(peerId, page.items, cov ?? undefined)
@@ -538,7 +606,7 @@ async function syncAfter(peerId: number) {
         return
       }
       const alive = guard(peerId)
-      const page = await listMessagesAfter(peerId, c.winHi, SYNC_PAGE)
+      const page = await fetchAfter(peerId, c.winHi, SYNC_PAGE)
       if (!alive()) return
       const cov = coveredAfter(page, c.winHi)
       if (cov) await cache.saveMessages(peerId, page.items, cov)
@@ -572,6 +640,79 @@ function receive(m: Message) {
     confirmLocals(peerId, [m])
     void syncAfter(peerId) // seq 跳号：中间有消息没收到（例如推送丢了），补拉
   }
+}
+
+// ---------- 删除（FR-19、FR-20） ----------
+
+// applyDeletion 我删除了与 peerId 的会话中的这些消息（本标签页的操作、推送、或者同步到的离线期间的删除）：
+// 从窗口和本地缓存里去掉。窗口覆盖的 seq 范围不变：被删的 seq 仍算"已同步"，只是没有消息了
+function applyDeletion(peerId: number, seqs: number[]) {
+  if (seqs.length === 0) return
+  let set = deletedSeqs.get(peerId)
+  if (!set) deletedSeqs.set(peerId, (set = new Set()))
+  for (const s of seqs) set.add(s)
+  void cache.deleteMessages(peerId, seqs)
+  const c = getConv(peerId)
+  if (c?.messages.some((m) => set.has(m.seq!))) {
+    updateConv(peerId, (c) => ({ ...c, messages: c.messages.filter((m) => !set.has(m.seq!)) }))
+  }
+  applyDeletionToList(peerId, seqs)
+}
+
+// applyClear 清空位置推进到了 clearedSeq（由会话列表的变化触发）：删除缓存，窗口里去掉被清空的部分
+function applyClear(peerId: number, clearedSeq: number) {
+  void cache.clearMessages(peerId, clearedSeq)
+  const c = getConv(peerId)
+  if (!c) return
+  updateConv(peerId, (c) => {
+    const winLo = Math.max(c.winLo, clearedSeq + 1)
+    return {
+      ...c,
+      messages: c.messages.filter((m) => m.seq! > clearedSeq),
+      winLo,
+      winHi: Math.max(c.winHi, winLo - 1), // 窗口整个被清空时变成空窗口 [cleared + 1, cleared]
+      hasMoreBefore: winLo > clearedSeq + 1,
+    }
+  })
+}
+
+// syncDeletions 登录、重连后，按游标拉取离线期间（在其他设备上）的删除记录，同样从本地去掉（FR-20）。
+// 推送不推进游标（推送里没有记录 ID），所以同一条删除可能处理两次，没有影响
+let deletionSync: Promise<void> | null = null
+
+function syncDeletions(): Promise<void> {
+  deletionSync ??= (async () => {
+    const token = currentToken()
+    try {
+      let cursor = await cache.loadDeletionCursor()
+      for (;;) {
+        const page = await listDeletions(cursor)
+        if (currentToken() !== token) return
+        const byPeer = new Map<number, number[]>()
+        for (const d of page.items) byPeer.set(d.peerId, [...(byPeer.get(d.peerId) ?? []), d.seq])
+        for (const [peerId, seqs] of byPeer) applyDeletion(peerId, seqs)
+        if (page.items.length > 0) {
+          cursor = page.items.at(-1)!.id
+          await cache.saveDeletionCursor(cursor)
+        }
+        if (!page.hasMore) return
+      }
+    } catch (err) {
+      console.warn('[chat] sync deletions failed', err) // 下次重连再同步
+    } finally {
+      deletionSync = null
+    }
+  })()
+  return deletionSync
+}
+
+function removeLocals(peerId: number, keys: string[]) {
+  if (keys.length === 0) return
+  const drop = new Set(keys)
+  useChatStore.setState((s) => ({
+    locals: { ...s.locals, [peerId]: (s.locals[peerId] ?? []).filter((m) => !drop.has(m.key)) },
+  }))
+  for (const k of keys) void cache.deleteLocal(k)
 }
 
 // ---------- 已读上报 ----------
@@ -701,11 +842,30 @@ socket.on('message.ack', (data) => {
     return
   }
   if (ack.code === Code.Internal) return // 服务端临时故障：保持发送中，ACK 计时器到了会重发
+  // 被限流（NFR-05）：标记失败但可以重试。不自动重发，否则只会继续撞上限流
+  if (ack.code === Code.TooManyRequests) {
+    markFailed(ack.clientMsgId, RATE_LIMITED_ERROR, true)
+    return
+  }
+  // 非好友限制（FR-12）：本地以为是好友，多半是对方删了我（删除好友不通知对方，FR-08），刷新好友列表让输入框按非好友显示
+  if (ack.code === Code.StrangerLimit) void useFriendStore.getState().loadFriends().catch(() => {})
   // 被服务端明确拒绝（过长、非好友等），重发也没用，标记失败，不能重试
   markFailed(ack.clientMsgId, ack.code === Code.MessageTooLong ? TOO_LONG_ERROR : ack.msg, false)
 })
 
 socket.on('message.new', (data) => receive((data as { message: Message }).message))
+
+// 我在其他标签页 / 设备上删除了消息、清空了聊天记录（FR-19 多设备同步）
+socket.on('message.deleted', (data) => {
+  const d = data as { peerId: number; seqs: number[] }
+  applyDeletion(d.peerId, d.seqs)
+})
+
+socket.on('chat.cleared', (data) => {
+  const d = data as { peerId: number; clearedSeq: number; readSeq: number }
+  if (summaryOf(d.peerId)) applyClearToList(d.peerId, d.clearedSeq, d.readSeq)
+  else void useChatListStore.getState().load() // 列表里还没有这个会话：拉一次，带回清空位置
+})
 
 // 每次连上：先重发还没确认的消息。断线重连时还要刷新会话列表（离线期间的新消息、未读数），
 // 再把内存里处于最新的窗口补齐（FR-17）；列表先拉完，补齐时才知道落后了多少
@@ -722,9 +882,18 @@ socket.onOpen(({ resumed }) => {
         if (c.ready && c.atLatest) void syncAfter(c.peerId)
       }
     })
+  void syncDeletions() // 断线期间可能在其他设备上删除了消息
 })
 
 socket.onStatus((connection) => useChatStore.setState({ connection }))
+
+// 清空位置变大了（本标签页清空、其他标签页 / 设备清空后的推送、登录和重连时拉到的会话列表）：清理窗口和本地缓存
+useChatListStore.subscribe((state, prev) => {
+  for (const [peer, c] of Object.entries(state.chats)) {
+    const cleared = c.clearedSeq ?? 0
+    if (cleared > (prev.chats[Number(peer)]?.clearedSeq ?? 0)) applyClear(Number(peer), cleared)
+  }
+})
 
 // 会话列表晚于会话打开才拉下来（例如直接刷新 /chat/:peerId）：这时才能确定"以下为新消息"画在哪里
 useChatListStore.subscribe(() => {
@@ -744,6 +913,7 @@ useAuthStore.subscribe((state, prev) => {
   readTimers.clear()
   syncing.clear()
   seen.clear()
+  deletedSeqs.clear()
   openPeer = null
   cache.closeCache()
   useChatStore.setState({ convs: {}, locals: {} })

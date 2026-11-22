@@ -315,3 +315,39 @@ func TestService_GetProfiles(t *testing.T) {
 		t.Errorf("profiles = %+v, want 只有 %d", profiles, u.ID)
 	}
 }
+
+// denyAfter 前 n 次放行，之后一律拒绝；记录用过的键
+type denyAfter struct {
+	n    int
+	keys []string
+}
+
+func (d *denyAfter) Allow(_ context.Context, key string) bool {
+	d.keys = append(d.keys, key)
+	return len(d.keys) <= d.n
+}
+
+// NFR-05：按目标账号限制登录尝试。成功、失败都计数，超出后连正确的密码也拒绝，且不再查库
+func TestService_Login_RateLimited(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepo()
+	lim := &denyAfter{n: 2}
+	svc := NewService(repo, fakeTokens{}, counterIDs(), WithLoginLimiter(lim))
+	u, err := svc.Register(ctx, validUsername, validPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.Login(ctx, u.ID, "Wrong1234"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("第 1 次：%v", err)
+	}
+	if _, err := svc.Login(ctx, u.ID, validPassword); err != nil {
+		t.Fatalf("第 2 次（正确密码）：%v", err)
+	}
+	if _, err := svc.Login(ctx, u.ID, validPassword); !errors.Is(err, ErrTooManyAttempts) {
+		t.Errorf("第 3 次应被限流：%v", err)
+	}
+	if want := strconv.FormatInt(u.ID, 10); lim.keys[0] != want {
+		t.Errorf("限流的键应是目标用户 ID：%q, want %q", lim.keys[0], want)
+	}
+}

@@ -28,12 +28,18 @@ import (
 
 type nopNotifier struct{}
 
-func (nopNotifier) MessageCreated(context.Context, *Message, []int64) {}
-func (nopNotifier) ReadUpdated(context.Context, int64, int64, int64)  {}
+func (nopNotifier) MessageCreated(context.Context, *Message, []int64)       {}
+func (nopNotifier) ReadUpdated(context.Context, int64, int64, int64)        {}
+func (nopNotifier) MessagesDeleted(context.Context, int64, int64, []int64)  {}
+func (nopNotifier) ChatCleared(context.Context, int64, int64, int64, int64) {}
 
 type allFriends struct{}
 
 func (allFriends) AreFriends(context.Context, int64, int64) (bool, error) { return true, nil }
+
+type noFriends struct{}
+
+func (noFriends) AreFriends(context.Context, int64, int64) (bool, error) { return false, nil }
 
 // setupDB 连接测试库，插入两个临时用户，测试结束后删除它们产生的所有数据
 func setupDB(t *testing.T) (*gorm.DB, int64, int64) {
@@ -69,6 +75,7 @@ func setupDBUsers(t *testing.T, n int) (*gorm.DB, []int64) {
 	t.Cleanup(func() {
 		// 按外键依赖倒序删除。这是测试库，物理删除没问题（生产数据永不物理删除消息，FR-21）
 		convs := db.Table("conversations").Select("id").Where("user_a IN ? OR user_b IN ?", ids, ids)
+		db.Exec("DELETE FROM message_deletions WHERE user_id IN ?", ids)
 		db.Exec("DELETE FROM messages WHERE conversation_id IN (?)", convs)
 		db.Exec("DELETE FROM conversation_members WHERE conversation_id IN (?)", convs)
 		db.Exec("DELETE FROM conversations WHERE user_a IN ? OR user_b IN ?", ids, ids)
@@ -113,7 +120,7 @@ func TestRepository_ConcurrentSend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgs, err := repo.ListAfter(ctx, conv.ID, 0, 100)
+	msgs, err := repo.ListAfter(ctx, conv.ID, a, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,6 +179,67 @@ func TestRepository_ConcurrentDuplicate(t *testing.T) {
 	next := mustSend(t, svc, b, a, "next", "x")
 	if next.Message.Seq != 3 {
 		t.Errorf("下一条消息 seq = %d, want 3", next.Message.Seq)
+	}
+}
+
+// FR-12 在真实数据库上的并发：非好友在多个标签页同时发不同的消息，只能有一条成功，且不留 seq 空洞；
+// 同一条消息并发重发，全部确认成功（去重优先于非好友限制）
+func TestRepository_StrangerLimitConcurrent(t *testing.T) {
+	db, a, b := setupDB(t)
+	repo := NewRepository(db)
+	svc := NewService(repo, noFriends{}, fakeDirectory{}, nopNotifier{})
+	mustSend(t, svc, b, a, "b1", "hi") // 会话里最后一条是 b 的，a 可以发一条，seq = 1
+
+	const n = 10
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var ok, limited int
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := svc.Send(ctx, a, b, fmt.Sprintf("a-%d", i), "hello")
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				ok++
+			case errors.Is(err, ErrStrangerLimit):
+				limited++
+			default:
+				t.Errorf("Send: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if ok != 1 || limited != n-1 {
+		t.Fatalf("成功 %d 条、被限制 %d 条；want 1, %d", ok, limited, n-1)
+	}
+	conv, _ := repo.FindConversation(ctx, a, b)
+	if conv.LastSeq != 2 {
+		t.Errorf("last_seq = %d, want 2（被拒绝的事务应回滚 seq）", conv.LastSeq)
+	}
+
+	// b 回复后，a 的同一条消息被并发重发：全部成功、同一个 seq，而不是除第一次外都被判成"第二条"
+	mustSend(t, svc, b, a, "b2", "hi") // seq = 3
+	results := make([]*SendResult, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := svc.Send(ctx, a, b, "same-id", "hello")
+			if err != nil {
+				t.Errorf("Send: %v", err)
+				return
+			}
+			results[i] = res
+		}()
+	}
+	wg.Wait()
+	for _, r := range results {
+		if r == nil || r.Message.Seq != 4 {
+			t.Fatalf("所有重发都应返回 seq 4，got %+v", r)
+		}
 	}
 }
 
@@ -260,5 +328,100 @@ func TestRepository_MarkRead(t *testing.T) {
 
 	if _, _, err := repo.MarkRead(ctx, conv.ID, c, 1); !errors.Is(err, ErrConversationNotFound) {
 		t.Errorf("非成员 err = %v, want ErrConversationNotFound", err)
+	}
+}
+
+// 删除、清空在真实数据库上的 SQL：过滤（ListAfter / ListBefore / LATERAL 会话列表）、幂等、清空位置和已读、游标同步
+func TestRepository_DeleteAndClear(t *testing.T) {
+	db, ids := setupDBUsers(t, 3)
+	a, b, c := ids[0], ids[1], ids[2]
+	repo := NewRepository(db)
+	svc := NewService(repo, allFriends{}, fakeDirectory{}, nopNotifier{})
+	for i := range 6 {
+		from, to := a, b
+		if i%2 == 1 {
+			from, to = b, a
+		}
+		mustSend(t, svc, from, to, fmt.Sprintf("m%d", i), fmt.Sprintf("msg %d", i+1)) // seq 1..6
+	}
+	mustSend(t, svc, a, c, "c1", "hi")
+	conv, _ := repo.FindConversation(ctx, a, b)
+	seqsOf := func(msgs []Message) []int64 {
+		out := []int64{}
+		for _, m := range msgs {
+			out = append(out, m.Seq)
+		}
+		return out
+	}
+
+	// 删除：只返回这次新删除的 seq；重复删除返回空
+	got, err := repo.DeleteMessages(ctx, conv.ID, a, []int64{2, 6})
+	if err != nil || !slices.Equal(got, []int64{2, 6}) {
+		t.Fatalf("DeleteMessages = %v, %v; want [2 6]", got, err)
+	}
+	if got, _ := repo.DeleteMessages(ctx, conv.ID, a, []int64{2, 3}); !slices.Equal(got, []int64{3}) {
+		t.Errorf("部分重复：返回 %v, want [3]", got)
+	}
+
+	after, _ := repo.ListAfter(ctx, conv.ID, a, 0, 100)
+	before, _ := repo.ListBefore(ctx, conv.ID, a, 0, 2)
+	other, _ := repo.ListAfter(ctx, conv.ID, b, 0, 100)
+	if !slices.Equal(seqsOf(after), []int64{1, 4, 5}) || !slices.Equal(seqsOf(before), []int64{4, 5}) || len(other) != 6 {
+		t.Errorf("a: after=%v before=%v; b: %d 条", seqsOf(after), seqsOf(before), len(other))
+	}
+
+	// 会话列表：a 的最后一条退到 seq 5，b 的仍是 6
+	sums, _ := repo.ListConversations(ctx, a)
+	var ab *ConversationSummary
+	for i := range sums {
+		if sums[i].Conversation.ID == conv.ID {
+			ab = &sums[i]
+		}
+	}
+	if ab == nil || ab.LastMessage == nil || ab.LastMessage.Seq != 5 || ab.LastMessage.Content != "msg 5" || ab.Conversation.LastSeq != 6 {
+		t.Fatalf("a 的会话：%+v", ab)
+	}
+
+	// 清空到 4：read_seq 一起推进；往回清空不变；超过 last_seq 按 last_seq
+	cleared, read, changed, err := repo.Clear(ctx, conv.ID, a, 4)
+	if err != nil || cleared != 4 || read != 5 || !changed { // a 发了 seq 5，read_seq 本来就是 5，取较大值
+		t.Errorf("Clear(4) = %d %d %v %v; want 4 5 true", cleared, read, changed, err)
+	}
+	if cleared, _, changed, _ := repo.Clear(ctx, conv.ID, a, 2); cleared != 4 || changed {
+		t.Errorf("往回清空：%d %v; want 4 false", cleared, changed)
+	}
+	after, _ = repo.ListAfter(ctx, conv.ID, a, 0, 100)
+	if !slices.Equal(seqsOf(after), []int64{5}) {
+		t.Errorf("清空到 4 后：%v, want [5]", seqsOf(after))
+	}
+	if cleared, read, _, _ := repo.Clear(ctx, conv.ID, a, 100); cleared != 6 || read != 6 {
+		t.Errorf("Clear(100) = %d %d; want 6 6", cleared, read)
+	}
+	sums, _ = repo.ListConversations(ctx, a)
+	for _, s := range sums {
+		if s.Conversation.ID == conv.ID && (s.LastMessage != nil || s.ClearedSeq != 6) {
+			t.Errorf("全部清空：lastMessage=%+v cleared=%d; want nil 6", s.LastMessage, s.ClearedSeq)
+		}
+	}
+	if _, _, _, err := repo.Clear(ctx, conv.ID, c, 1); !errors.Is(err, ErrConversationNotFound) {
+		t.Errorf("非成员清空：err = %v", err)
+	}
+
+	// 删除记录同步：按 id 升序，对方 ID 换算正确，只含自己的
+	cc, _ := repo.FindConversation(ctx, a, c)
+	_, _ = repo.DeleteMessages(ctx, cc.ID, a, []int64{1})
+	_, _ = repo.DeleteMessages(ctx, conv.ID, b, []int64{1})
+	ds, err := repo.ListDeletions(ctx, a, 0, 100)
+	if err != nil || len(ds) != 4 {
+		t.Fatalf("ListDeletions = %+v, %v; want 4 条", ds, err)
+	}
+	want := []Deletion{{PeerID: b, Seq: 2}, {PeerID: b, Seq: 6}, {PeerID: b, Seq: 3}, {PeerID: c, Seq: 1}}
+	for i, d := range ds {
+		if d.PeerID != want[i].PeerID || d.Seq != want[i].Seq || (i > 0 && d.ID <= ds[i-1].ID) {
+			t.Errorf("第 %d 条 = %+v, want peer %d seq %d、id 递增", i, d, want[i].PeerID, want[i].Seq)
+		}
+	}
+	if ds2, _ := repo.ListDeletions(ctx, a, ds[1].ID, 1); len(ds2) != 1 || ds2[0].ID != ds[2].ID {
+		t.Errorf("游标分页：%+v", ds2)
 	}
 }

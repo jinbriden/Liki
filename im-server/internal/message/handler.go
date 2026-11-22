@@ -23,6 +23,9 @@ const (
 	TypeAck  = "message.ack"  // 服务端 → 发送消息的那个连接：写库成功或失败的确认
 	TypeNew  = "message.new"  // 服务端 → 会话双方的所有在线连接：有新消息
 	TypeRead = "chat.read"    // 服务端 → 自己的所有在线连接：某个会话的已读位置推进了（不推给对方）
+
+	TypeDeleted = "message.deleted" // 服务端 → 自己的所有在线连接：我删除了某个会话里的若干条消息（不推给对方）
+	TypeCleared = "chat.cleared"    // 服务端 → 自己的所有在线连接：我清空了某个会话的聊天记录（不推给对方）
 )
 
 // Handler 消息模块的接口层，同时处理 HTTP 请求和 WebSocket 数据包。
@@ -40,6 +43,9 @@ func (h *Handler) RegisterRoutes(_, protected *gin.RouterGroup) {
 	protected.GET("/chats", h.listChats)
 	protected.GET("/chats/:peerId/messages", h.listMessages)
 	protected.POST("/chats/:peerId/read", h.markRead)
+	protected.POST("/chats/:peerId/messages/delete", h.deleteMessages) // 带请求体的批量删除，用 POST 而不是 DELETE
+	protected.POST("/chats/:peerId/clear", h.clearChat)
+	protected.GET("/message-deletions", h.listDeletions)
 }
 
 // PacketRouter 网关注册数据包处理函数的能力，由 *gateway.Gateway 实现
@@ -84,6 +90,7 @@ func toMessageResp(m *Message) messageResp {
 type pageResp struct {
 	Items   []messageResp `json:"items"`
 	HasMore bool          `json:"hasMore"`
+	LastSeq int64         `json:"lastSeq"` // 会话最新的 seq，见 Page.LastSeq
 }
 
 // profileResp 对方的用户资料，字段和好友模块的一致
@@ -98,13 +105,14 @@ func toProfileResp(p user.Profile) profileResp {
 }
 
 // chatResp 会话列表中的一项（FR-14）。
-// lastMessageAt 用于排序；M5 里它和 lastMessage.createdAt 相同，M6 删除消息后 lastMessage 可能是更早的一条，
-// 甚至为 null（全部删光），所以单独给出，lastMessage 用指针。
+// lastMessageAt 用于排序，是会话里真正最后一条消息的时间；lastMessage 是我能看到的最后一条，
+// 删除消息后可能是更早的一条，甚至为 null（全部删除或清空），所以两者分开给出。
 type chatResp struct {
 	Peer          profileResp  `json:"peer"`
 	LastMessage   *messageResp `json:"lastMessage"`
 	LastSeq       int64        `json:"lastSeq"`
 	ReadSeq       int64        `json:"readSeq"`
+	ClearedSeq    int64        `json:"clearedSeq"`
 	Unread        int64        `json:"unread"`
 	LastMessageAt time.Time    `json:"lastMessageAt"`
 }
@@ -119,6 +127,30 @@ type markReadReq struct {
 
 type markReadResp struct {
 	ReadSeq int64 `json:"readSeq"`
+}
+
+type deleteReq struct {
+	Seqs []int64 `json:"seqs"`
+}
+
+type clearReq struct {
+	UpToSeq int64 `json:"upToSeq"`
+}
+
+type clearResp struct {
+	ClearedSeq int64 `json:"clearedSeq"`
+	ReadSeq    int64 `json:"readSeq"`
+}
+
+type deletionResp struct {
+	ID     int64 `json:"id"`
+	PeerID int64 `json:"peerId"`
+	Seq    int64 `json:"seq"`
+}
+
+type deletionPageResp struct {
+	Items   []deletionResp `json:"items"`
+	HasMore bool           `json:"hasMore"`
 }
 
 type sendData struct {
@@ -144,7 +176,10 @@ const (
 	msgContentTooLong = "消息过长，请重新发送" // FR-13：上限 1500 字
 	msgInvalidContent = "消息包含不支持的字符"
 	msgInvalidPeer    = "不能和自己聊天"
-	msgNotFriends     = "对方不是你的好友，无法发送消息"
+	msgStrangerLimit  = "对方回复或成为好友前，只能发送一条消息"
+	msgDeleteCount    = "一次可以删除 1～30 条消息"
+	msgRateLimited    = "发送太频繁，请稍后再试"
+	msgInvalidSeq     = "消息不存在"
 	msgInternal       = "服务器内部错误"
 )
 
@@ -163,8 +198,16 @@ func errorCode(err error) (status, code int, msg string) {
 		return http.StatusBadRequest, response.CodeBadRequest, msgBadRequest // 前端代码的 bug
 	case errors.Is(err, ErrInvalidPeer):
 		return http.StatusBadRequest, response.CodeInvalidParam, msgInvalidPeer
-	case errors.Is(err, ErrNotFriends):
-		return http.StatusForbidden, response.CodeNotFriends, msgNotFriends
+	case errors.Is(err, ErrStrangerLimit):
+		return http.StatusForbidden, response.CodeStrangerLimit, msgStrangerLimit
+	case errors.Is(err, ErrRateLimited):
+		return http.StatusTooManyRequests, response.CodeTooManyRequests, msgRateLimited
+	case errors.Is(err, ErrInvalidDeleteCount):
+		return http.StatusBadRequest, response.CodeInvalidParam, msgDeleteCount
+	case errors.Is(err, ErrInvalidSeq):
+		return http.StatusBadRequest, response.CodeInvalidParam, msgInvalidSeq
+	case errors.Is(err, ErrInvalidClearSeq):
+		return http.StatusBadRequest, response.CodeBadRequest, msgBadRequest // 前端代码的 bug
 	default:
 		return http.StatusInternalServerError, response.CodeInternal, msgInternal
 	}
@@ -211,7 +254,7 @@ func (h *Handler) listMessages(c *gin.Context) {
 	for i := range page.Messages {
 		items = append(items, toMessageResp(&page.Messages[i]))
 	}
-	response.OK(c, pageResp{Items: items, HasMore: page.HasMore})
+	response.OK(c, pageResp{Items: items, HasMore: page.HasMore, LastSeq: page.LastSeq})
 }
 
 // listChats GET /chats：我的会话列表，按最后一条消息的时间倒序，不分页（FR-14）
@@ -230,12 +273,17 @@ func (h *Handler) listChats(c *gin.Context) {
 	items := make([]chatResp, 0, len(views))
 	for i := range views {
 		v := &views[i]
-		last := toMessageResp(&v.LastMessage)
+		var last *messageResp
+		if v.LastMessage != nil {
+			r := toMessageResp(v.LastMessage)
+			last = &r
+		}
 		items = append(items, chatResp{
 			Peer:          toProfileResp(v.Peer),
-			LastMessage:   &last,
+			LastMessage:   last,
 			LastSeq:       v.LastSeq,
 			ReadSeq:       v.ReadSeq,
+			ClearedSeq:    v.ClearedSeq,
 			Unread:        v.Unread,
 			LastMessageAt: v.LastMessageAt.UTC(),
 		})
@@ -268,6 +316,86 @@ func (h *Handler) markRead(c *gin.Context) {
 		return
 	}
 	response.OK(c, markReadResp{ReadSeq: readSeq})
+}
+
+// deleteMessages POST /chats/:peerId/messages/delete {seqs}：删除我和 peerId 的会话中的 1～30 条消息（FR-19），
+// 只对自己生效。已经删过的再删算成功。
+func (h *Handler) deleteMessages(c *gin.Context) {
+	peerID, err := strconv.ParseInt(c.Param("peerId"), 10, 64)
+	if err != nil || peerID <= 0 {
+		response.Fail(c, http.StatusBadRequest, response.CodeBadRequest, msgBadRequest)
+		return
+	}
+	var req deleteReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, http.StatusBadRequest, response.CodeBadRequest, msgBadRequest)
+		return
+	}
+
+	ctx := c.Request.Context()
+	if err := h.svc.DeleteMessages(ctx, auth.UserID(c), peerID, req.Seqs); err != nil {
+		status, code, msg := errorCode(err)
+		if code == response.CodeInternal {
+			slog.ErrorContext(ctx, "delete messages failed", "peer_id", peerID, "err", err)
+		}
+		response.Fail(c, status, code, msg)
+		return
+	}
+	response.OK(c, nil)
+}
+
+// clearChat POST /chats/:peerId/clear {upToSeq}：清空我和 peerId 的聊天记录到 upToSeq（FR-19），同时视为已读。
+// 返回清空后的 clearedSeq 和 readSeq。
+func (h *Handler) clearChat(c *gin.Context) {
+	peerID, err := strconv.ParseInt(c.Param("peerId"), 10, 64)
+	if err != nil || peerID <= 0 {
+		response.Fail(c, http.StatusBadRequest, response.CodeBadRequest, msgBadRequest)
+		return
+	}
+	var req clearReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, http.StatusBadRequest, response.CodeBadRequest, msgBadRequest)
+		return
+	}
+
+	ctx := c.Request.Context()
+	res, err := h.svc.Clear(ctx, auth.UserID(c), peerID, req.UpToSeq)
+	if err != nil {
+		status, code, msg := errorCode(err)
+		if code == response.CodeInternal {
+			slog.ErrorContext(ctx, "clear chat failed", "peer_id", peerID, "err", err)
+		}
+		response.Fail(c, status, code, msg)
+		return
+	}
+	response.OK(c, clearResp{ClearedSeq: res.ClearedSeq, ReadSeq: res.ReadSeq})
+}
+
+// listDeletions GET /message-deletions?after=&limit=：我在所有会话里的删除记录，id > after，按 id 升序（FR-20）。
+// 客户端登录、重连时从上次的游标往后拉，hasMore 为 true 时以最后一条的 id 继续。
+func (h *Handler) listDeletions(c *gin.Context) {
+	after, okA := queryInt(c, "after")
+	limit, okL := queryInt(c, "limit")
+	if !okA || !okL {
+		response.Fail(c, http.StatusBadRequest, response.CodeBadRequest, msgBadRequest)
+		return
+	}
+
+	ctx := c.Request.Context()
+	items, hasMore, err := h.svc.ListDeletions(ctx, auth.UserID(c), after, int(limit))
+	if err != nil {
+		status, code, msg := errorCode(err)
+		if code == response.CodeInternal {
+			slog.ErrorContext(ctx, "list deletions failed", "err", err)
+		}
+		response.Fail(c, status, code, msg)
+		return
+	}
+	out := make([]deletionResp, 0, len(items))
+	for _, d := range items {
+		out = append(out, deletionResp{ID: d.ID, PeerID: d.PeerID, Seq: d.Seq})
+	}
+	response.OK(c, deletionPageResp{Items: out, HasMore: hasMore})
 }
 
 // queryInt 解析可选的非负整数查询参数。没传时返回 (0, true)，格式不对返回 ok=false

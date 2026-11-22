@@ -13,6 +13,8 @@ Web 端即时通讯软件，个人学习项目（Go 后端 + React 前端 + Post
   - `internal/pkg/response/`：统一响应格式 `{code, msg, data}` 和错误码常量（常量名以代码为准）
   - `internal/pkg/auth/`：JWT 签发/校验（`JWTManager`）和鉴权中间件；handler 用 `auth.UserID(c)` 取当前用户
   - `internal/pkg/logger/`：slog 初始化（控制台 + JSON 文件）、请求 ID / 访问日志 / panic 恢复中间件、`logger.WithAttrs(ctx, ...)` 把字段挂到 ctx 上
+  - `internal/pkg/reqctx/`：写请求（非 GET）和 WebSocket 数据包处理改用 `context.WithoutCancel` 派生的 ctx（保留日志字段、30 秒超时兜底），客户端中途断开时已开始的写操作照样完成并推送
+  - `internal/pkg/ratelimit/`：限流（NFR-05）。`Limiter` 接口 + 内存令牌桶（`golang.org/x/time/rate`）；规则集中在 `main.go`，按"方法 路由模板"挂在路由组上，启动时核对规则里的路由都存在
   - `migrations/`：golang-migrate 的 SQL 迁移文件
 - `web/`：React + TS + Vite 前端（antd 6、React Router 8、Zustand 5），结构见 `web/README.md`
   - Node 用 WSL 内 nvm 安装的版本（不要用 PATH 里 Windows 的 npm）
@@ -41,6 +43,9 @@ Web 端即时通讯软件，个人学习项目（Go 后端 + React 前端 + Post
   - 日志里不能出现密码、令牌、WebSocket 票据和消息正文（消息只记长度）；访问日志只记路径，不记查询参数。
 - 时间字段（如 `created_at`）由数据库 `now()` 生成：model 上用 `gorm:"autoCreateTime:false;default:now()"`，GORM 插入时通过 `RETURNING` 取回，保证返回值和库里一致（微秒精度）。不要用 Go 的 `time.Now()` 写入。
 - 接口输出的时间一律转成 UTC（`.UTC()`，JSON 形如 `...Z`）。
+- handler 一律从 `c.Request.Context()` 取 ctx（`reqctx` 中间件替换的就是它），不要直接把 `*gin.Context` 当 ctx 传。
+- 限流：按 IP / 用户的规则加在 `main.go` 的 `ipRules` / `userRules`；需要业务信息才能判断的（按登录的目标账号、发消息要排除去重命中）放在 service，用函数式选项注入（`user.WithLoginLimiter`、`message.WithSendLimiter`）。
+- `gin` 设置了 `SetTrustedProxies(nil)`：`c.ClientIP()` 取 TCP 对端地址，开发时经过 Vite 代理都是 127.0.0.1；部署到反向代理后面时要改成信任代理地址。
 
 ## 常用命令
 
@@ -96,7 +101,7 @@ npm run lint
   - 发消息：`message.send {clientMsgId, toUserId, content}` → 服务端回 `message.ack {clientMsgId, code, msg, message?}`，并向双方所有连接（含发送方自己的其他标签页）推 `message.new {message}`。
   - 可靠性：按 `(sender_id, client_msg_id)` 去重，重复提交返回已有消息；seq 在事务里 `UPDATE conversations ... RETURNING last_seq` 分配，冲突回滚不留空洞。单元测试 + `im_test` 库上的并发测试覆盖。
   - 拉取：`GET /api/v1/chats/:peerId/messages?afterSeq=`（增量同步）或 `?beforeSeq=`（向前翻页，都不带为最新一页），返回 `{items, hasMore}`，按 seq 升序。
-  - M4 阶段非好友一律不能发消息（40003），FR-12 的"最多一条"放到 M6。
+  - 非好友发消息的规则见 M6（FR-12，40004）；M4、M5 阶段的 40003 已废弃。
   - 好友实时通知：`friend.request.received`（给被申请方）、`friend.request.handled`（给申请方）、`friend.sync`（给操作者自己的其他连接）。
   - 前端：`src/realtime/socket.ts`（连接、心跳、指数退避重连）、`src/stores/chat.ts`（发送中队列、5 秒未 ACK 重发、30 秒标记失败可重试、seq 不连续时补拉、超长消息只在本地显示为失败）、聊天页。消息暂存内存，IndexedDB 缓存在 M5。
 - M5 会话与历史：已完成并验收（完成标准"清除缓存后重新登录，历史可以按需分页恢复"已用端到端测试验证）。需求见 requirements.md（FR-14～FR-18）：只列有消息的会话 + 临时项；未读 = last_seq − read_seq，read_seq 只增不减，由"实际看到（连续推进）"、"发送即已读"、"标记为已读"三种方式推进，参照 Discord 提供跳转到第一条未读；IndexedDB 按用户分库，主动退出时删除；用"已同步 seq 区间"处理缓存缺口；滚到顶部自动翻页。
@@ -104,7 +109,17 @@ npm run lint
   - 前端已完成并用 Playwright 端到端验证：`src/db/chatCache.ts`（Dexie，库名 `liki-<用户 ID>`）、`src/utils/ranges.ts`（已同步区间）、`src/stores/chatList.ts`（会话列表、未读）、`src/stores/chat.ts`（消息窗口、已读推进、跳转）、`src/stores/session.ts`（主动退出删缓存）、聊天页改为会话列表。验证覆盖：离线未读 → 横条 → 跳转 → 逐步已读、停在底部自动已读、连发多条时被跳过的不算已读、标记为已读、发送即已读、多标签页同步、快照显示、落后 100 条以上的缺口补齐（翻到顶 seq 连续无遗漏、第二次全部读本地）、退出删库后重新登录历史完整恢复。
   - 顶部"N 条新消息"横条的条件是"未读 > 0 且看到过的最大 seq > readSeq"（有未读被跳过），"跳转"目标是当前 readSeq + 1；"以下为新消息"分隔线固定在打开时的位置，且只在窗口包含它时才画。
   - 消息区设了 `overflow-anchor: none`：向上翻页的滚动补偿由代码按第一条消息的 DOM 节点位移来做，不能再叠加 Chrome 的自动滚动锚定，否则会多滚一截、中间的消息被跳过而永远不算已读。
-- 待办：登录、注册限流（NFR-05，M6）；连接建立后令牌过期不会主动断开 WebSocket（重连时换票据会失败，届时跳转登录）。
+- M6 删除与限制：已完成并验收（迁移 000007；完成标准"删除的消息换一个浏览器登录后仍不出现"已用端到端测试验证）。需求按讨论结果更新了 requirements.md（FR-12、FR-14、FR-19、FR-20、NFR-05，第 8 节两条已勾选）。
+  - 非好友限制（FR-12）：会话里上一条消息也是自己发的就拒绝（40004），对方回复一条可再发一条；好友不受限。"上一条是谁发的"在 `Create` 事务里分配 seq（持有会话行锁）**并插入之后**检查——放在插入之后，非好友重发已写入的消息会先撞上去重约束，不会被误判成第二条。前端：非好友时输入框上方提示、最后一条是自己的就锁输入框、头部"非好友"标记和"添加好友"、搜索结果可直接"发消息"（`chatList.peers` 暂存陌生人资料）；收到 40004 时刷新好友列表（对方可能删了我）。
+  - 删除（FR-19～21）：逐条 / 多选批量（一次 1～30 条）/ 清空聊天记录，只对自己生效，服务端不物理删除。
+    - 表：`message_deletions(id, user_id, message_id, deleted_at)`，主键 `(user_id, message_id)` 保证幂等，自增 `id` 作为多设备同步游标；`conversation_members.cleared_seq` 记清空位置（清空不逐条写记录），清空同时把 read_seq 推进到同一位置。
+    - 接口：`POST /chats/:peerId/messages/delete {seqs}`；`POST /chats/:peerId/clear {upToSeq}`（客户端点击时已知的最新 seq，之后到的消息不受影响）返回 `{clearedSeq, readSeq}`；`GET /message-deletions?after=` 按游标分页。拉消息的接口过滤自己删除 / 清空的，并多返回 `lastSeq`（最后几条被删时客户端据此把已同步区间补到最新，否则会反复加载）；`GET /chats` 多返回 `clearedSeq`，`lastMessage` 是自己能看到的最后一条（LATERAL 子查询），全部删光时为 null、会话仍在列表中。
+    - 删除事务里先 `pg_advisory_xact_lock(user_id)`：同一用户的删除串行，删除记录的 id 顺序 = 提交顺序，按游标同步不会漏。
+    - 多设备同步：在线的靠推送 `message.deleted {peerId, seqs}`、`chat.cleared {peerId, clearedSeq, readSeq}`（只推给自己）；离线的在登录、重连时按游标拉删除记录（游标存 IndexedDB 的 `meta` 表，Dexie version 2），会话列表的 clearedSeq 变大时删除本地缓存。被删的 seq 留在已同步区间里，不当成缺口。
+    - 前端：消息悬停出现"⋯"菜单（多选 / 删除），多选模式下输入框换成"已选 N / 30"操作条，头部"⋯"菜单里有"清空聊天记录"，都要二次确认；发送中的不能删，发送失败 / 超长的只删本地。
+  - 限流（NFR-05）：注册每 IP 每小时 10 次、登录每 IP 每分钟 20 次 + 每个目标账号每分钟 5 次、好友申请每用户每小时 30 次、换票据每用户每分钟 30 次、发消息每用户每秒 5 条（突发 10 条，去重命中的重发不计数）；超出返回 10004 / HTTP 429。前端被限流的消息标记为"发送太频繁，点击重试"，不自动重发。
+  - 顺带修复：客户端在写请求途中断开时，数据库已提交但驱动报 context canceled，接口返回 500、提交后的推送被跳过（例如同意好友申请后申请方收不到通知）。用 `reqctx` 让写操作不随客户端断开而取消。
+- 待办：连接建立后令牌过期不会主动断开 WebSocket（重连时换票据会失败，届时跳转登录）；个人资料页（requirements.md 第 8 节未定）。
 
 ## 协作方式
 
