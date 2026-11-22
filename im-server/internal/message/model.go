@@ -12,6 +12,7 @@ var (
 	ErrInvalidContent     = errors.New("message content contains unsupported characters")
 	ErrInvalidClientMsgID = errors.New("invalid client message id")
 	ErrInvalidPeer        = errors.New("invalid peer user")
+	ErrInvalidReadSeq     = errors.New("invalid read seq")
 	ErrNotFriends         = errors.New("not friends")
 
 	ErrConversationNotFound = errors.New("conversation not found")
@@ -62,6 +63,14 @@ type Message struct {
 
 	// RecipientID 接收方，不是表里的列（gorm:"-"），由 service 根据会话双方填上，方便推送和接口输出
 	RecipientID int64 `gorm:"-"`
+}
+
+// ConversationSummary 会话列表中的一项在 repository 层的样子：会话本身、我的已读位置、最后一条消息。
+// 由 ListConversations 一次 JOIN 查出来，service 再补上对方的资料。
+type ConversationSummary struct {
+	Conversation Conversation
+	ReadSeq      int64
+	LastMessage  Message
 }
 
 // pairOf 把两个用户 ID 排成 (较小, 较大)，对应 conversations 表的 (user_a, user_b)

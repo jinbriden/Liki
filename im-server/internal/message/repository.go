@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -25,9 +26,17 @@ type Repository interface {
 	// FindByClientMsgID 按 (sender_id, client_msg_id) 查消息，没有时返回 ErrMessageNotFound。
 	FindByClientMsgID(ctx context.Context, senderID int64, clientMsgID string) (*Message, error)
 
-	// Create 在一个事务里给会话分配下一个 seq 并插入消息；成功后 m.ID、m.Seq、m.CreatedAt 由数据库回填。
+	// Create 在一个事务里给会话分配下一个 seq、插入消息，并把发送方的 read_seq 推进到这个 seq（FR-15 发送即已读）；
+	// 成功后 m.ID、m.Seq、m.CreatedAt 由数据库回填。
 	// (sender_id, client_msg_id) 已存在 → ErrDuplicateMessage，此时整个事务回滚，seq 不会被占用。
 	Create(ctx context.Context, m *Message) error
+
+	// ListConversations userID 参与的、至少有一条消息的会话，按最后一条消息的时间倒序（FR-14）。
+	ListConversations(ctx context.Context, userID int64) ([]ConversationSummary, error)
+
+	// MarkRead 把 userID 在会话中的 read_seq 推进到 seq（FR-15）：只增不减，超过 last_seq 时按 last_seq 算。
+	// 返回推进后的 read_seq，changed 表示这次是否真的变了。userID 不是会话成员时返回 ErrConversationNotFound。
+	MarkRead(ctx context.Context, conversationID, userID, seq int64) (readSeq int64, changed bool, err error)
 
 	// ListAfter 会话中 seq > afterSeq 的消息，按 seq 升序，最多 limit 条（增量同步）。
 	ListAfter(ctx context.Context, conversationID, afterSeq int64, limit int) ([]Message, error)
@@ -143,8 +152,115 @@ func (r *gormRepository) Create(ctx context.Context, m *Message) error {
 		if errors.Is(err, gorm.ErrDuplicatedKey) {
 			return ErrDuplicateMessage
 		}
-		return err
+		if err != nil {
+			return err
+		}
+
+		// 3. 发送即已读（FR-15）：发送方回复了，视为已读完这条消息之前的所有消息。
+		//    和分配 seq 放在同一个事务里，要么一起生效、要么一起回滚。
+		//    GREATEST 只是保险：seq 是刚分配的最大值，正常情况下一定不小于原来的 read_seq。
+		return tx.Exec(
+			"UPDATE conversation_members SET read_seq = GREATEST(read_seq, ?) WHERE conversation_id = ? AND user_id = ?",
+			seq, m.ConversationID, m.SenderID,
+		).Error
 	})
+}
+
+// conversationRow ListConversations 查询结果的一行（会话 + 我的成员记录 + 最后一条消息拍平在一起）。
+// GORM 按字段名的 snake_case 映射列名，所以 SQL 里用 AS 把列名对上。
+type conversationRow struct {
+	ConversationID int64
+	UserA          int64
+	UserB          int64
+	LastSeq        int64
+	LastMessageAt  time.Time
+	ConvCreatedAt  time.Time
+	ReadSeq        int64
+	MessageID      int64
+	SenderID       int64
+	ClientMsgID    string
+	Type           string
+	Content        string
+	CreatedAt      time.Time
+}
+
+func (r *gormRepository) ListConversations(ctx context.Context, userID int64) ([]ConversationSummary, error) {
+	// 最后一条消息按 (conversation_id, seq = last_seq) 取，走唯一索引 uq_messages_conversation_seq。
+	// last_seq > 0 过滤掉"建了会话但还没有消息"的情况（此时 last_message_at 为 NULL）。
+	// M6 加入逐条删除后，"最后一条"要排除自己删掉的消息，这里会改成 LATERAL 子查询。
+	var rows []conversationRow
+	err := r.db.WithContext(ctx).Raw(`
+SELECT c.id AS conversation_id, c.user_a, c.user_b, c.last_seq, c.last_message_at, c.created_at AS conv_created_at,
+       cm.read_seq,
+       m.id AS message_id, m.sender_id, m.client_msg_id, m.type, m.content, m.created_at
+FROM conversation_members cm
+JOIN conversations c ON c.id = cm.conversation_id
+JOIN messages m ON m.conversation_id = c.id AND m.seq = c.last_seq
+WHERE cm.user_id = ? AND c.last_seq > 0
+ORDER BY c.last_message_at DESC, c.id DESC`, userID).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]ConversationSummary, 0, len(rows))
+	for _, row := range rows {
+		lastAt := row.LastMessageAt
+		out = append(out, ConversationSummary{
+			Conversation: Conversation{
+				ID:            row.ConversationID,
+				UserA:         row.UserA,
+				UserB:         row.UserB,
+				LastSeq:       row.LastSeq,
+				LastMessageAt: &lastAt,
+				CreatedAt:     row.ConvCreatedAt,
+			},
+			ReadSeq: row.ReadSeq,
+			LastMessage: Message{
+				ID:             row.MessageID,
+				ConversationID: row.ConversationID,
+				Seq:            row.LastSeq,
+				SenderID:       row.SenderID,
+				ClientMsgID:    row.ClientMsgID,
+				Type:           row.Type,
+				Content:        row.Content,
+				CreatedAt:      row.CreatedAt,
+			},
+		})
+	}
+	return out, nil
+}
+
+func (r *gormRepository) MarkRead(ctx context.Context, conversationID, userID, seq int64) (int64, bool, error) {
+	db := r.db.WithContext(ctx)
+
+	// 只在"确实会变大"时才更新：重复上报同一个位置（多个标签页、节流边界）不产生写入，也不触发推送。
+	// LEAST(?, c.last_seq)：客户端报的 seq 超过会话最大值时按最大值算，read_seq 不会跑到 last_seq 前面。
+	// UPDATE ... FROM 只锁 conversation_members 这一行，不锁 conversations，不会和发消息的事务互相等待成环。
+	var readSeq int64
+	res := db.Raw(`
+UPDATE conversation_members cm
+SET read_seq = LEAST(?, c.last_seq)
+FROM conversations c
+WHERE c.id = cm.conversation_id AND cm.conversation_id = ? AND cm.user_id = ?
+  AND cm.read_seq < LEAST(?, c.last_seq)
+RETURNING cm.read_seq`, seq, conversationID, userID, seq).Scan(&readSeq)
+	if res.Error != nil {
+		return 0, false, res.Error
+	}
+	if res.RowsAffected == 1 {
+		return readSeq, true, nil
+	}
+
+	// 没更新：要么已读位置本来就不小于 seq，要么根本不是成员。查一次当前值区分两者
+	var m ConversationMember
+	err := db.Where("conversation_id = ? AND user_id = ?", conversationID, userID).Take(&m).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, false, ErrConversationNotFound
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return m.ReadSeq, false, nil
 }
 
 func (r *gormRepository) ListAfter(ctx context.Context, conversationID, afterSeq int64, limit int) ([]Message, error) {

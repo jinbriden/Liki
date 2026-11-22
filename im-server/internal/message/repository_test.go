@@ -2,6 +2,7 @@ package message
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -28,6 +29,7 @@ import (
 type nopNotifier struct{}
 
 func (nopNotifier) MessageCreated(context.Context, *Message, []int64) {}
+func (nopNotifier) ReadUpdated(context.Context, int64, int64, int64)  {}
 
 type allFriends struct{}
 
@@ -35,6 +37,13 @@ func (allFriends) AreFriends(context.Context, int64, int64) (bool, error) { retu
 
 // setupDB 连接测试库，插入两个临时用户，测试结束后删除它们产生的所有数据
 func setupDB(t *testing.T) (*gorm.DB, int64, int64) {
+	t.Helper()
+	db, ids := setupDBUsers(t, 2)
+	return db, ids[0], ids[1]
+}
+
+// setupDBUsers 同 setupDB，插入 n 个临时用户（ID 连续）
+func setupDBUsers(t *testing.T, n int) (*gorm.DB, []int64) {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_DSN")
 	if dsn == "" {
@@ -49,28 +58,29 @@ func setupDB(t *testing.T) (*gorm.DB, int64, int64) {
 	}
 
 	// 随机 10 位 ID，避免和库里已有数据、并行运行的其他测试冲突
-	a := 1_000_000_000 + rand.Int64N(8_000_000_000)
-	b := a + 1
-	for _, id := range []int64{a, b} {
-		if err := db.Exec("INSERT INTO users (id, username, password_hash) VALUES (?, ?, 'x')", id, fmt.Sprintf("t%d", id)).Error; err != nil {
+	base := 1_000_000_000 + rand.Int64N(8_000_000_000)
+	ids := make([]int64, n)
+	for i := range ids {
+		ids[i] = base + int64(i)
+		if err := db.Exec("INSERT INTO users (id, username, password_hash) VALUES (?, ?, 'x')", ids[i], fmt.Sprintf("t%d", ids[i])).Error; err != nil {
 			t.Fatalf("insert user: %v", err)
 		}
 	}
 	t.Cleanup(func() {
 		// 按外键依赖倒序删除。这是测试库，物理删除没问题（生产数据永不物理删除消息，FR-21）
-		convs := db.Table("conversations").Select("id").Where("user_a IN ? OR user_b IN ?", []int64{a, b}, []int64{a, b})
+		convs := db.Table("conversations").Select("id").Where("user_a IN ? OR user_b IN ?", ids, ids)
 		db.Exec("DELETE FROM messages WHERE conversation_id IN (?)", convs)
 		db.Exec("DELETE FROM conversation_members WHERE conversation_id IN (?)", convs)
-		db.Exec("DELETE FROM conversations WHERE user_a IN ? OR user_b IN ?", []int64{a, b}, []int64{a, b})
-		db.Exec("DELETE FROM users WHERE id IN ?", []int64{a, b})
+		db.Exec("DELETE FROM conversations WHERE user_a IN ? OR user_b IN ?", ids, ids)
+		db.Exec("DELETE FROM users WHERE id IN ?", ids)
 	})
-	return db, a, b
+	return db, ids
 }
 
 func TestRepository_ConcurrentSend(t *testing.T) {
 	db, a, b := setupDB(t)
 	repo := NewRepository(db)
-	svc := NewService(repo, allFriends{}, nopNotifier{})
+	svc := NewService(repo, allFriends{}, fakeDirectory{}, nopNotifier{})
 
 	const n = 30
 	var wg sync.WaitGroup
@@ -126,7 +136,7 @@ func TestRepository_ConcurrentSend(t *testing.T) {
 func TestRepository_ConcurrentDuplicate(t *testing.T) {
 	db, a, b := setupDB(t)
 	repo := NewRepository(db)
-	svc := NewService(repo, allFriends{}, nopNotifier{})
+	svc := NewService(repo, allFriends{}, fakeDirectory{}, nopNotifier{})
 	mustSend(t, svc, a, b, "first", "hi") // 先建好会话，seq = 1
 
 	// 同一条消息被并发重发 10 次：全部返回成功、拿到同一个 seq，库里只有一条
@@ -162,5 +172,93 @@ func TestRepository_ConcurrentDuplicate(t *testing.T) {
 	next := mustSend(t, svc, b, a, "next", "x")
 	if next.Message.Seq != 3 {
 		t.Errorf("下一条消息 seq = %d, want 3", next.Message.Seq)
+	}
+}
+
+// 会话列表的 SQL（JOIN 最后一条消息、列名映射、排序）和发送即已读
+func TestRepository_ListConversations(t *testing.T) {
+	db, ids := setupDBUsers(t, 3)
+	a, b, c := ids[0], ids[1], ids[2]
+	repo := NewRepository(db)
+	svc := NewService(repo, allFriends{}, fakeDirectory{}, nopNotifier{})
+
+	mustSend(t, svc, b, a, "b1", "one")
+	mustSend(t, svc, b, a, "b2", "two")
+	mustSend(t, svc, a, b, "a1", "three") // a 回复：a 的 read_seq → 3
+	mustSend(t, svc, b, a, "b3", "four")  // a 有 1 条未读
+	mustSend(t, svc, c, a, "c1", "from c")
+	if _, err := repo.EnsureConversation(ctx, b, c); err != nil { // 没有消息的会话
+		t.Fatal(err)
+	}
+
+	sums, err := repo.ListConversations(ctx, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sums) != 2 {
+		t.Fatalf("len = %d, want 2", len(sums))
+	}
+	if sums[0].Conversation.peerOf(a) != c || sums[1].Conversation.peerOf(a) != b {
+		t.Errorf("顺序不对：want [c, b]")
+	}
+	ab := sums[1]
+	if ab.Conversation.LastSeq != 4 || ab.ReadSeq != 3 {
+		t.Errorf("lastSeq/readSeq = %d/%d, want 4/3", ab.Conversation.LastSeq, ab.ReadSeq)
+	}
+	m := ab.LastMessage
+	if m.Seq != 4 || m.Content != "four" || m.SenderID != b || m.ClientMsgID != "b3" || m.Type != TypeText || m.ID == 0 {
+		t.Errorf("lastMessage = %+v", m)
+	}
+	if m.CreatedAt.IsZero() || ab.Conversation.LastMessageAt == nil || !ab.Conversation.LastMessageAt.Equal(m.CreatedAt) {
+		t.Errorf("created_at = %v, last_message_at = %v；应相同（同一事务的 now()）", m.CreatedAt, ab.Conversation.LastMessageAt)
+	}
+
+	// b 的视角：他最后发了 seq 4（b3），read_seq 随之推进到 4，没有未读
+	bs, err := repo.ListConversations(ctx, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bs) != 1 || bs[0].ReadSeq != 4 {
+		t.Errorf("b sums = %+v, want 1 个会话、read_seq 4", bs)
+	}
+}
+
+// MarkRead 的条件更新：只增不减、不超过 last_seq、非成员
+func TestRepository_MarkRead(t *testing.T) {
+	db, ids := setupDBUsers(t, 3)
+	a, b, c := ids[0], ids[1], ids[2]
+	repo := NewRepository(db)
+	svc := NewService(repo, allFriends{}, fakeDirectory{}, nopNotifier{})
+	for i := range 3 {
+		mustSend(t, svc, b, a, fmt.Sprintf("b%d", i), "hi")
+	}
+	conv, err := repo.FindConversation(ctx, a, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	steps := []struct {
+		seq     int64
+		want    int64
+		changed bool
+	}{
+		{2, 2, true},
+		{2, 2, false},
+		{1, 2, false},
+		{50, 3, true}, // 超过 last_seq 按 last_seq 算
+		{50, 3, false},
+	}
+	for _, st := range steps {
+		got, changed, err := repo.MarkRead(ctx, conv.ID, a, st.seq)
+		if err != nil {
+			t.Fatalf("MarkRead(%d): %v", st.seq, err)
+		}
+		if got != st.want || changed != st.changed {
+			t.Errorf("MarkRead(%d) = (%d, %v), want (%d, %v)", st.seq, got, changed, st.want, st.changed)
+		}
+	}
+
+	if _, _, err := repo.MarkRead(ctx, conv.ID, c, 1); !errors.Is(err, ErrConversationNotFound) {
+		t.Errorf("非成员 err = %v, want ErrConversationNotFound", err)
 	}
 }

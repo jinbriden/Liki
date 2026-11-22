@@ -18,12 +18,18 @@ const (
 	carol int64 = 1000000003
 )
 
+// testDirectory carol 故意不在里面：验证查不到资料时会话列表只返回 ID，不报错
+var testDirectory = fakeDirectory{
+	alice: {ID: alice, Username: "alice"},
+	bob:   {ID: bob, Username: "bob", AvatarURL: "/a/bob.png"},
+}
+
 func newTestService() (*Service, *fakeRepo, fakeFriends, *fakeNotifier) {
 	repo := newFakeRepo()
 	friends := fakeFriends{}
 	friends.set(alice, bob, true)
 	n := &fakeNotifier{}
-	return NewService(repo, friends, n), repo, friends, n
+	return NewService(repo, friends, testDirectory, n), repo, friends, n
 }
 
 func mustSend(t *testing.T, svc *Service, from, to int64, clientMsgID, content string) *SendResult {

@@ -99,7 +99,8 @@ func run() error {
 	friendHandler := friend.NewHandler(friendSvc)
 
 	messageRepo := message.NewRepository(db)
-	messageSvc := message.NewService(messageRepo, friendSvc, message.NewNotifier(gw)) // *friend.Service 满足 message.FriendChecker
+	// *friend.Service 满足 message.FriendChecker，*user.Service 满足 message.UserDirectory
+	messageSvc := message.NewService(messageRepo, friendSvc, userSvc, message.NewNotifier(gw))
 	messageHandler := message.NewHandler(messageSvc)
 	messageHandler.RegisterPackets(gw)
 

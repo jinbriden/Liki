@@ -5,7 +5,10 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"time"
 	"unicode/utf8"
+
+	"im-server/internal/user"
 )
 
 const (
@@ -24,21 +27,33 @@ type FriendChecker interface {
 	AreFriends(ctx context.Context, a, b int64) (bool, error)
 }
 
-// Notifier 新消息写库成功后，通知相关用户（实时推送）。
+// UserDirectory 消息模块需要的用户资料查询能力（会话列表显示对方头像和用户名），由 *user.Service 实现。
+// 和好友模块一样不直接查 users 表、不跨模块 JOIN（NFR-07）。
+type UserDirectory interface {
+	// GetProfiles 批量查用户资料；不存在的 ID 直接跳过，返回顺序不保证。
+	GetProfiles(ctx context.Context, ids []int64) ([]user.Profile, error)
+}
+
+// Notifier 消息相关的实时通知。
 // service 只决定"通知谁"，推送的数据格式和怎么送达由实现决定（见 notify.go），service 不依赖 WebSocket。
-// 推送是尽力而为的，不返回错误：接收方没收到也没关系，重连后会按 seq 增量同步补齐。
+// 推送是尽力而为的，不返回错误：没收到也没关系，重连后会按 seq 增量同步、刷新会话列表补齐。
 type Notifier interface {
+	// MessageCreated 新消息写库成功，推送给 recipients 的所有连接
 	MessageCreated(ctx context.Context, m *Message, recipients []int64)
+	// ReadUpdated userID 在与 peerID 的会话中的已读位置推进到了 readSeq，
+	// 同步给他自己的所有连接（FR-04、FR-15：多处登录时未读数一致）。不通知对方：本阶段不做已读回执。
+	ReadUpdated(ctx context.Context, userID, peerID, readSeq int64)
 }
 
 type Service struct {
 	repo     Repository
 	friends  FriendChecker
+	users    UserDirectory
 	notifier Notifier
 }
 
-func NewService(repo Repository, friends FriendChecker, notifier Notifier) *Service {
-	return &Service{repo: repo, friends: friends, notifier: notifier}
+func NewService(repo Repository, friends FriendChecker, users UserDirectory, notifier Notifier) *Service {
+	return &Service{repo: repo, friends: friends, users: users, notifier: notifier}
 }
 
 // SendResult 发送结果。Duplicate 为 true 表示这条消息之前已经写过（客户端重发），返回的是已有的那条。
@@ -205,6 +220,98 @@ func (s *Service) list(ctx context.Context, me, peerID int64, limit int, backwar
 	}
 	page.Messages = msgs
 	return page, nil
+}
+
+// ConversationView 会话列表中的一项（FR-14）
+type ConversationView struct {
+	Peer          user.Profile
+	LastMessage   Message
+	LastSeq       int64
+	ReadSeq       int64
+	Unread        int64 // = LastSeq - ReadSeq（FR-15）。自己发的消息不会被算进来：发送时 read_seq 已推进到它的 seq
+	LastMessageAt time.Time
+}
+
+// ListConversations me 参与的、有消息的会话，按最后一条消息的时间倒序（FR-14）。不分页，第一阶段会话数量有限。
+func (s *Service) ListConversations(ctx context.Context, me int64) ([]ConversationView, error) {
+	sums, err := s.repo.ListConversations(ctx, me)
+	if err != nil {
+		return nil, err
+	}
+	if len(sums) == 0 {
+		return []ConversationView{}, nil
+	}
+
+	peerIDs := make([]int64, 0, len(sums))
+	for i := range sums {
+		peerIDs = append(peerIDs, sums[i].Conversation.peerOf(me))
+	}
+	list, err := s.users.GetProfiles(ctx, peerIDs)
+	if err != nil {
+		return nil, err
+	}
+	profiles := make(map[int64]user.Profile, len(list))
+	for _, p := range list {
+		profiles[p.ID] = p
+	}
+
+	views := make([]ConversationView, 0, len(sums))
+	for i := range sums {
+		sum := &sums[i]
+		conv := &sum.Conversation
+		peerID := conv.peerOf(me)
+		peer, ok := profiles[peerID]
+		if !ok {
+			peer = user.Profile{ID: peerID} // 理论上外键保证查得到；查不到时只返回 ID，不让整个列表失败
+		}
+		last := sum.LastMessage
+		last.RecipientID = conv.peerOf(last.SenderID)
+		views = append(views, ConversationView{
+			Peer:          peer,
+			LastMessage:   last,
+			LastSeq:       conv.LastSeq,
+			ReadSeq:       sum.ReadSeq,
+			Unread:        max(0, conv.LastSeq-sum.ReadSeq),
+			LastMessageAt: *conv.LastMessageAt,
+		})
+	}
+	return views, nil
+}
+
+// MarkRead 把 me 在与 peerID 的会话中的已读位置推进到 seq（FR-15），返回推进后的 read_seq。
+//
+// "什么时候算看到"由客户端判断（消息真正出现在可视范围内、点了"标记为已读"），服务端只保证：
+// read_seq 只增不减、不超过 last_seq。所以重复上报、乱序上报、多个标签页同时上报都是安全的。
+// 还没聊过（会话不存在）时返回 0，不报错。read_seq 真的变了才推送给自己的其他连接。
+func (s *Service) MarkRead(ctx context.Context, me, peerID, seq int64) (int64, error) {
+	if peerID <= 0 || peerID == me {
+		return 0, ErrInvalidPeer
+	}
+	if seq < 0 {
+		return 0, ErrInvalidReadSeq
+	}
+
+	conv, err := s.repo.FindConversation(ctx, me, peerID)
+	if errors.Is(err, ErrConversationNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	readSeq, changed, err := s.repo.MarkRead(ctx, conv.ID, me, seq)
+	if errors.Is(err, ErrConversationNotFound) {
+		return 0, nil // 会话存在但我不是成员：单聊里不会发生，按"没聊过"处理
+	}
+	if err != nil {
+		return 0, err
+	}
+	if changed {
+		// Debug：阅读时会频繁上报，属于"正常但频繁"的情况
+		slog.DebugContext(ctx, "read seq advanced", "conversation_id", conv.ID, "peer_id", peerID, "read_seq", readSeq)
+		s.notifier.ReadUpdated(ctx, me, peerID, readSeq)
+	}
+	return readSeq, nil
 }
 
 func validateClientMsgID(id string) error {

@@ -14,6 +14,7 @@ import (
 	"im-server/internal/gateway"
 	"im-server/internal/pkg/auth"
 	"im-server/internal/pkg/response"
+	"im-server/internal/user"
 )
 
 // WebSocket 数据包类型（NFR-09）
@@ -21,6 +22,7 @@ const (
 	TypeSend = "message.send" // 客户端 → 服务端：发送消息
 	TypeAck  = "message.ack"  // 服务端 → 发送消息的那个连接：写库成功或失败的确认
 	TypeNew  = "message.new"  // 服务端 → 会话双方的所有在线连接：有新消息
+	TypeRead = "chat.read"    // 服务端 → 自己的所有在线连接：某个会话的已读位置推进了（不推给对方）
 )
 
 // Handler 消息模块的接口层，同时处理 HTTP 请求和 WebSocket 数据包。
@@ -35,7 +37,9 @@ func NewHandler(svc *Service) *Handler {
 
 // RegisterRoutes 注册 HTTP 路由，全部需要登录
 func (h *Handler) RegisterRoutes(_, protected *gin.RouterGroup) {
+	protected.GET("/chats", h.listChats)
 	protected.GET("/chats/:peerId/messages", h.listMessages)
+	protected.POST("/chats/:peerId/read", h.markRead)
 }
 
 // PacketRouter 网关注册数据包处理函数的能力，由 *gateway.Gateway 实现
@@ -82,6 +86,41 @@ type pageResp struct {
 	HasMore bool          `json:"hasMore"`
 }
 
+// profileResp 对方的用户资料，字段和好友模块的一致
+type profileResp struct {
+	ID        int64  `json:"id"`
+	Username  string `json:"username"`
+	AvatarURL string `json:"avatarUrl"`
+}
+
+func toProfileResp(p user.Profile) profileResp {
+	return profileResp{ID: p.ID, Username: p.Username, AvatarURL: p.AvatarURL}
+}
+
+// chatResp 会话列表中的一项（FR-14）。
+// lastMessageAt 用于排序；M5 里它和 lastMessage.createdAt 相同，M6 删除消息后 lastMessage 可能是更早的一条，
+// 甚至为 null（全部删光），所以单独给出，lastMessage 用指针。
+type chatResp struct {
+	Peer          profileResp  `json:"peer"`
+	LastMessage   *messageResp `json:"lastMessage"`
+	LastSeq       int64        `json:"lastSeq"`
+	ReadSeq       int64        `json:"readSeq"`
+	Unread        int64        `json:"unread"`
+	LastMessageAt time.Time    `json:"lastMessageAt"`
+}
+
+type chatListResp struct {
+	Items []chatResp `json:"items"`
+}
+
+type markReadReq struct {
+	Seq int64 `json:"seq"`
+}
+
+type markReadResp struct {
+	ReadSeq int64 `json:"readSeq"`
+}
+
 type sendData struct {
 	ClientMsgID string `json:"clientMsgId"`
 	ToUserID    int64  `json:"toUserId"` // 接收方；发送方一律取连接上的用户 ID，数据包里不带
@@ -104,7 +143,7 @@ const (
 	msgEmptyContent   = "不能发送空白消息"
 	msgContentTooLong = "消息过长，请重新发送" // FR-13：上限 1500 字
 	msgInvalidContent = "消息包含不支持的字符"
-	msgInvalidPeer    = "不能给自己发消息"
+	msgInvalidPeer    = "不能和自己聊天"
 	msgNotFriends     = "对方不是你的好友，无法发送消息"
 	msgInternal       = "服务器内部错误"
 )
@@ -120,6 +159,8 @@ func errorCode(err error) (status, code int, msg string) {
 		return http.StatusBadRequest, response.CodeMessageTooLong, msgContentTooLong
 	case errors.Is(err, ErrInvalidContent):
 		return http.StatusBadRequest, response.CodeInvalidParam, msgInvalidContent
+	case errors.Is(err, ErrInvalidReadSeq):
+		return http.StatusBadRequest, response.CodeBadRequest, msgBadRequest // 前端代码的 bug
 	case errors.Is(err, ErrInvalidPeer):
 		return http.StatusBadRequest, response.CodeInvalidParam, msgInvalidPeer
 	case errors.Is(err, ErrNotFriends):
@@ -171,6 +212,62 @@ func (h *Handler) listMessages(c *gin.Context) {
 		items = append(items, toMessageResp(&page.Messages[i]))
 	}
 	response.OK(c, pageResp{Items: items, HasMore: page.HasMore})
+}
+
+// listChats GET /chats：我的会话列表，按最后一条消息的时间倒序，不分页（FR-14）
+func (h *Handler) listChats(c *gin.Context) {
+	ctx := c.Request.Context()
+	views, err := h.svc.ListConversations(ctx, auth.UserID(c))
+	if err != nil {
+		status, code, msg := errorCode(err)
+		if code == response.CodeInternal {
+			slog.ErrorContext(ctx, "list chats failed", "err", err)
+		}
+		response.Fail(c, status, code, msg)
+		return
+	}
+
+	items := make([]chatResp, 0, len(views))
+	for i := range views {
+		v := &views[i]
+		last := toMessageResp(&v.LastMessage)
+		items = append(items, chatResp{
+			Peer:          toProfileResp(v.Peer),
+			LastMessage:   &last,
+			LastSeq:       v.LastSeq,
+			ReadSeq:       v.ReadSeq,
+			Unread:        v.Unread,
+			LastMessageAt: v.LastMessageAt.UTC(),
+		})
+	}
+	response.OK(c, chatListResp{Items: items})
+}
+
+// markRead POST /chats/:peerId/read {seq}：把我在这个会话里的已读位置推进到 seq（FR-15）。
+// 只增不减、不超过会话最新的 seq；返回推进后的 readSeq（可能比请求的小，也可能比请求的大）。
+func (h *Handler) markRead(c *gin.Context) {
+	peerID, err := strconv.ParseInt(c.Param("peerId"), 10, 64)
+	if err != nil || peerID <= 0 {
+		response.Fail(c, http.StatusBadRequest, response.CodeBadRequest, msgBadRequest)
+		return
+	}
+	var req markReadReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, http.StatusBadRequest, response.CodeBadRequest, msgBadRequest)
+		return
+	}
+
+	ctx := c.Request.Context()
+	readSeq, err := h.svc.MarkRead(ctx, auth.UserID(c), peerID, req.Seq)
+	if err != nil {
+		status, code, msg := errorCode(err)
+		if code == response.CodeInternal {
+			slog.ErrorContext(ctx, "mark read failed", "peer_id", peerID, "err", err)
+		}
+		response.Fail(c, status, code, msg)
+		return
+	}
+	response.OK(c, markReadResp{ReadSeq: readSeq})
 }
 
 // queryInt 解析可选的非负整数查询参数。没传时返回 (0, true)，格式不对返回 ok=false
