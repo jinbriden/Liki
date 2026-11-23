@@ -8,8 +8,15 @@ const (
 	CodeBadRequest      = 10002 // 请求体无法解析（JSON 格式/类型错误），通常是调用方代码的 bug
 	CodeUnauthorized    = 10003 // 未登录或令牌无效/过期：前端收到后应清除令牌并跳转登录页
 	CodeTooManyRequests = 10004 // 请求太频繁，被限流（NFR-05），HTTP 429：msg 可直接展示，稍后重试即可
+	CodeForbidden       = 10005 // 已登录，但没有权限做这件事（如非管理员生成邀请码），HTTP 403
 
 	CodeInvalidCredentials = 20001 // 登录失败：用户 ID 或密码错误（同为 401，但前端不应跳转登录页）
+	CodeAccountPending     = 20002 // 登录失败：密码正确，账号待审核（FR-22），HTTP 403
+	CodeAccountRejected    = 20003 // 登录失败：密码正确，注册未通过审核（FR-22），HTTP 403
+	CodeInvalidInvite      = 20004 // 验证邀请码失败：不存在、过期、已使用或已作废（不区分，FR-23）
+	CodeInviteNotFound     = 20005 // 邀请码不存在，或不是自己生成的（查看、作废时）
+	CodeInviteInUse        = 20006 // 邀请码有效，但正被别人使用（对方验证通过后正在填写注册表单），HTTP 409
+	CodeReservationLost    = 20007 // 邀请码的验证已失效（冻结到期、被作废），续期、提交注册时返回，前端回到验证那一步
 
 	// 好友模块 3xxxx
 	CodeCannotAddSelf         = 30001 // 不能添加自己为好友

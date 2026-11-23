@@ -1,9 +1,10 @@
-import { LogoutOutlined, MessageOutlined, TeamOutlined } from '@ant-design/icons'
-import { App, Badge, Button, Modal, Popover, Tooltip, Typography } from 'antd'
-import { useEffect, type ReactNode } from 'react'
+import { LogoutOutlined, MessageOutlined, TeamOutlined, UserAddOutlined } from '@ant-design/icons'
+import { App, Badge, Button, Popover, Tooltip, Typography } from 'antd'
+import { useEffect, useState, type ReactNode } from 'react'
 import { NavLink, Outlet } from 'react-router'
 import type { FriendRequest } from '../api/friend'
 import { UserAvatar } from '../components/UserAvatar'
+import InviteModal from '../pages/InviteModal'
 import { socket } from '../realtime/socket'
 import { useAuthStore } from '../stores/auth'
 // 导入聊天 store 时它就订阅了推送，不在聊天页时收到的消息也不会丢
@@ -49,7 +50,6 @@ export default function MainLayout() {
       <main className="app-main">
         <Outlet />
       </main>
-      <NewUserModal />
     </div>
   )
 }
@@ -94,10 +94,12 @@ function useFriendNotifications() {
   }, [notification])
 }
 
-// UserMenu 导航栏底部自己的头像，点击显示账号信息和退出按钮
+// UserMenu 导航栏底部自己的头像，点击显示账号信息、邀请注册（有权限时）和退出按钮
 function UserMenu() {
   // RequireAuth 保证渲染到这里时 user 一定存在
   const user = useAuthStore((s) => s.user)!
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [inviteOpen, setInviteOpen] = useState(false)
 
   const content = (
     <div style={{ width: 220 }}>
@@ -112,6 +114,20 @@ function UserMenu() {
           </Typography.Text>
         </div>
       </div>
+      {/* 邀请注册（FR-23）：是否显示由后端返回的 canInvite 决定，现阶段只有管理员能看到 */}
+      {user.canInvite && (
+        <Button
+          block
+          icon={<UserAddOutlined />}
+          style={{ marginBottom: 8 }}
+          onClick={() => {
+            setMenuOpen(false)
+            setInviteOpen(true)
+          }}
+        >
+          邀请注册
+        </Button>
+      )}
       {/* 退出登录（FR-03）：清除本地令牌和本地缓存，服务端没有 logout 接口；令牌清除后 WebSocket 随之断开 */}
       <Button block icon={<LogoutOutlined />} onClick={() => void logout()}>
         退出登录
@@ -120,12 +136,15 @@ function UserMenu() {
   )
 
   return (
-    <Popover content={content} trigger="click" placement="rightBottom">
-      <button type="button" aria-label="我的账号" className="app-nav-me">
-        <UserAvatar user={user} size={34} />
-        <PresenceDot />
-      </button>
-    </Popover>
+    <>
+      <Popover content={content} trigger="click" placement="rightBottom" open={menuOpen} onOpenChange={setMenuOpen}>
+        <button type="button" aria-label="我的账号" className="app-nav-me">
+          <UserAvatar user={user} size={34} />
+          <PresenceDot />
+        </button>
+      </Popover>
+      {user.canInvite && <InviteModal open={inviteOpen} onClose={() => setInviteOpen(false)} />}
+    </>
   )
 }
 
@@ -150,30 +169,5 @@ function LogoMark() {
       />
       <path d="M9 9.5v4h3.5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
-  )
-}
-
-// NewUserModal 注册后自动登录进来时，提醒用户记住系统分配的用户 ID
-function NewUserModal() {
-  const newUserId = useAuthStore((s) => s.newUserId)
-  const setNewUserId = useAuthStore((s) => s.setNewUserId)
-
-  return (
-    <Modal
-      open={newUserId !== null}
-      title="注册成功"
-      okText="我记住了"
-      cancelButtonProps={{ style: { display: 'none' } }}
-      closable={false}
-      mask={{ closable: false }}
-      keyboard={false}
-      onOk={() => setNewUserId(null)}
-    >
-      <p>你的用户 ID 是：</p>
-      <Typography.Title level={3} copyable style={{ marginTop: 0 }}>
-        {String(newUserId)}
-      </Typography.Title>
-      <p>登录时需要使用用户 ID（不是用户名），请复制保存好。别人也可以通过这个 ID 搜索到你。</p>
-    </Modal>
   )
 }

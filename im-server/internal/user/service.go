@@ -80,12 +80,29 @@ func NewService(repo Repository, tokens TokenIssuer, newID IDGenerator, opts ...
 	return s
 }
 
-// Register 注册新用户。用户名允许重复，按用户输入原样保存；账号由随机生成的 ID 唯一标识。
-func (s *Service) Register(ctx context.Context, username, password string) (*User, error) {
+// Register 提交注册申请（FR-01、FR-22、FR-23）。用户名允许重复，按用户输入原样保存；账号由随机生成的 ID 唯一标识。
+// 必须持有邀请码的冻结令牌（先通过 InviteService.Verify 验证），提交成功后邀请码立即失效（与审核结果无关）；
+// 新账号是待审核状态，管理员批准后才能登录。
+func (s *Service) Register(ctx context.Context, username, password, inviteCode, reservationToken string) (*User, error) {
 	if err := validateUsername(username); err != nil {
 		return nil, err
 	}
 	if err := validatePassword(password); err != nil {
+		return nil, err
+	}
+	code, ok := NormalizeInviteCode(inviteCode)
+	if !ok || reservationToken == "" {
+		slog.InfoContext(ctx, "register rejected", "reason", "no_reservation") // 不记录邀请码和令牌
+		return nil, ErrReservationLost
+	}
+	tokenHash := hashToken(reservationToken)
+	// 先只读地检查一次冻结，必须放在 bcrypt 之前：bcrypt 故意设计得很慢（约 100ms CPU），
+	// 如果先算哈希，别人拿无效的令牌反复提交，每次都要白白消耗服务器的算力。
+	// 这一步只是快速拒绝，真正的判断在下面事务里的条件更新（两步之间冻结可能刚好到期、被作废）
+	if err := s.repo.CheckReservation(ctx, code, tokenHash); err != nil {
+		if errors.Is(err, ErrReservationLost) {
+			slog.InfoContext(ctx, "register rejected", "reason", "reservation_lost")
+		}
 		return nil, err
 	}
 
@@ -94,20 +111,24 @@ func (s *Service) Register(ctx context.Context, username, password string) (*Use
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
 
-	u := &User{Username: username, PasswordHash: string(hash)}
+	u := &User{Username: username, PasswordHash: string(hash), Status: StatusPending}
 	// 随机 ID 有极小概率和已有账号相同，此时主键约束会拒绝插入，换一个 ID 重试
 	for range maxIDAttempts {
 		if u.ID, err = s.newID(); err != nil {
 			return nil, fmt.Errorf("generate user id: %w", err)
 		}
-		err = s.repo.Create(ctx, u)
+		err = s.repo.CreateWithInvite(ctx, u, code, tokenHash)
 		if errors.Is(err, ErrDuplicateID) {
 			continue
+		}
+		if errors.Is(err, ErrReservationLost) {
+			slog.InfoContext(ctx, "register rejected", "reason", "reservation_lost_in_tx")
+			return nil, err
 		}
 		if err != nil {
 			return nil, err
 		}
-		slog.InfoContext(ctx, "user registered", "new_user_id", u.ID)
+		slog.InfoContext(ctx, "user registered", "new_user_id", u.ID, "invite_id", *u.InviteCodeID)
 		return u, nil
 	}
 	return nil, fmt.Errorf("allocate user id: still conflicting after %d attempts", maxIDAttempts)
@@ -165,6 +186,21 @@ func (s *Service) Login(ctx context.Context, userID int64, password string) (*Lo
 	if err != nil {
 		// 库里的哈希格式损坏等异常情况，属于服务端问题，不能当成"密码错误"掩盖掉
 		return nil, fmt.Errorf("compare password: %w", err)
+	}
+
+	// 审核状态（FR-22）必须在密码校验通过之后再判断：
+	// 反过来的话，不知道密码的人只要随便输一个密码，就能从错误码看出某个 ID 是待审核还是已拒绝
+	switch u.Status {
+	case StatusActive:
+	case StatusPending:
+		slog.InfoContext(ctx, "login rejected", "login_user_id", userID, "reason", "account_pending")
+		return nil, ErrAccountPending
+	case StatusRejected:
+		slog.InfoContext(ctx, "login rejected", "login_user_id", userID, "reason", "account_rejected")
+		return nil, ErrAccountRejected
+	default:
+		// 数据库 CHECK 约束保证不会出现其他值；真出现了是服务端问题，不能放行
+		return nil, fmt.Errorf("unknown account status %q", u.Status)
 	}
 
 	token, expiresAt, err := s.tokens.Issue(u.ID)
@@ -251,6 +287,12 @@ func (s *Service) SearchProfiles(ctx context.Context, keyword string, limit int)
 		return nil, err
 	}
 	return toProfiles(users), nil
+}
+
+// ParseID 解析 10 位用户 ID（命令行工具、配置项用），不是合法 ID 时 ok 为 false
+func ParseID(s string) (id int64, ok bool) {
+	id = parseUserID(strings.TrimSpace(s))
+	return id, id != 0
 }
 
 // parseUserID keyword 恰好是 10 位数字时返回对应 ID，否则返回 0。

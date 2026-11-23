@@ -27,6 +27,8 @@ type Config struct {
 	File    string     // 日志文件路径，空字符串表示只输出到控制台；文件里固定写 JSON，便于 grep / jq 检索
 	LogSQL  bool       // 是否记录每一条 SQL（参数用占位符代替，不记录参数值）
 	SlowSQL time.Duration
+	// NoConsole 不输出到控制台，只写文件（命令行工具用：控制台留给命令本身的输出，审计日志照样进文件）
+	NoConsole bool
 }
 
 const defaultLogFile = "logs/im-server.log"
@@ -74,14 +76,22 @@ func Setup(cfg Config) (close func() error, err error) {
 	}
 
 	handler := console
+	if cfg.NoConsole {
+		handler = slog.DiscardHandler
+	}
 	close = func() error { return nil }
 	if cfg.File != "" {
 		f, err := openLogFile(cfg.File)
 		if err != nil {
 			return nil, err
 		}
-		// MultiHandler（Go 1.26+）把同一条日志分发给多个 handler：控制台给人看，文件给工具查
-		handler = slog.NewMultiHandler(console, slog.NewJSONHandler(f, opts))
+		file := slog.NewJSONHandler(f, opts)
+		if cfg.NoConsole {
+			handler = file
+		} else {
+			// MultiHandler（Go 1.26+）把同一条日志分发给多个 handler：控制台给人看，文件给工具查
+			handler = slog.NewMultiHandler(console, file)
+		}
 		close = f.Close
 	}
 

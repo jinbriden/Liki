@@ -2,7 +2,7 @@ import { Alert, Button, Form, Input } from 'antd'
 import { useState } from 'react'
 import { Link, useLocation } from 'react-router'
 import { login } from '../api/auth'
-import { errorMessage } from '../api/client'
+import { Code, errorMessage, isApiError } from '../api/client'
 import { AuthCard } from '../components/AuthCard'
 import { useAuthStore } from '../stores/auth'
 import { isValidUserId, MSG_INVALID_USER_ID } from '../utils/validators'
@@ -12,7 +12,7 @@ interface LoginForm {
   password: string
 }
 
-// 注册后自动登录失败时，注册页会带着用户 ID 跳过来，预先填好
+// 注册成功后点"去登录"，注册页会带着用户 ID 跳过来，预先填好
 interface LoginPageState {
   userId?: number
 }
@@ -22,7 +22,7 @@ export default function LoginPage() {
   const location = useLocation()
   const prefillId = (location.state as LoginPageState | null)?.userId
   const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<{ msg: string; type: 'error' | 'warning' } | null>(null)
 
   async function onFinish(values: LoginForm) {
     setSubmitting(true)
@@ -32,15 +32,17 @@ export default function LoginPage() {
       // 写入令牌后，GuestOnly 守卫会自动跳转到首页（或登录前想去的页面）
       setAuth(res.token, res.user)
     } catch (err) {
-      // 20001（ID 或密码错误）留在本页提示，不跳转
-      setError(errorMessage(err))
+      // 20001（ID 或密码错误）留在本页提示，不跳转。
+      // 20002 / 20003（密码正确但账号待审核 / 未通过，FR-22）不是输错了，用警告样式区分
+      const reviewing = isApiError(err, Code.AccountPending, Code.AccountRejected)
+      setError({ msg: errorMessage(err), type: reviewing ? 'warning' : 'error' })
       setSubmitting(false)
     }
   }
 
   return (
     <AuthCard title="登录">
-      {error && <Alert type="error" title={error} showIcon style={{ marginBottom: 16 }} />}
+      {error && <Alert type={error.type} title={error.msg} showIcon style={{ marginBottom: 16 }} />}
       <Form<LoginForm>
         layout="vertical"
         requiredMark={false}
@@ -72,7 +74,7 @@ export default function LoginPage() {
         </Form.Item>
       </Form>
       <div style={{ textAlign: 'center' }}>
-        还没有账号？<Link to="/register">注册</Link>
+        有邀请码？<Link to="/register">注册</Link>
       </div>
     </AuthCard>
   )

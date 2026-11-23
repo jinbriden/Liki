@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -56,13 +57,24 @@ func TestService_Register(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc, _ := newTestService()
-			u, err := svc.Register(context.Background(), tt.username, tt.password)
+			env := newTestEnv()
+			inv := env.newInvite(t, InviteOptions{})
+			token := env.reserve(t, inv.Code)
+			u, err := env.svc.Register(context.Background(), tt.username, tt.password, inv.Code, token)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("err = %v, want %v", err, tt.wantErr)
 			}
 			if tt.wantErr != nil {
+				if got := env.repo.invite(inv.ID); got.UsedAt != nil || got.StateAt(time.Now()) != InviteReserved {
+					t.Errorf("注册失败不应使用邀请码，冻结应保留（可以改正后再提交）：%+v", got)
+				}
 				return
+			}
+			if u.Status != StatusPending {
+				t.Errorf("status = %q, 新账号应为待审核", u.Status)
+			}
+			if u.InviteCodeID == nil || *u.InviteCodeID != inv.ID {
+				t.Errorf("invite_code_id = %v, want %d", u.InviteCodeID, inv.ID)
 			}
 			if u.ID < minUserID || u.ID > maxUserID {
 				t.Errorf("ID = %d, 不是 10 位数", u.ID)
@@ -79,13 +91,10 @@ func TestService_Register(t *testing.T) {
 
 // 用户名不去重：同名（含大小写不同）都能注册成功，靠不同的 ID 区分
 func TestService_Register_DuplicateUsername(t *testing.T) {
-	svc, _ := newTestService()
+	env := newTestEnv()
 	seen := map[int64]bool{}
 	for _, name := range []string{"alice", "alice", "Alice"} {
-		u, err := svc.Register(context.Background(), name, validPassword)
-		if err != nil {
-			t.Fatalf("注册 %q 失败: %v", name, err)
-		}
+		u := env.register(t, name)
 		if seen[u.ID] {
 			t.Fatalf("ID %d 重复", u.ID)
 		}
@@ -93,44 +102,54 @@ func TestService_Register_DuplicateUsername(t *testing.T) {
 	}
 }
 
-// 生成的 ID 和已有账号冲突时，换一个 ID 重试
+// 生成的 ID 和已有账号冲突时，换一个 ID 重试；冲突的那几次不消耗邀请码（事务回滚）
 func TestService_Register_RetryOnDuplicateID(t *testing.T) {
-	repo := newFakeRepo()
+	env := newTestEnv()
 	const taken, fresh = 1111111111, 2222222222
-	svc := NewService(repo, fakeTokens{}, fixedIDs(taken, taken, taken, fresh))
+	svc := NewService(env.repo, fakeTokens{}, fixedIDs(taken, taken, taken, fresh))
 
 	ctx := context.Background()
-	if _, err := svc.Register(ctx, "first", validPassword); err != nil { // 占用 taken
+	first := env.newInvite(t, InviteOptions{}).Code
+	if _, err := svc.Register(ctx, "first", validPassword, first, env.reserve(t, first)); err != nil { // 占用 taken
 		t.Fatalf("准备数据失败: %v", err)
 	}
-	u, err := svc.Register(ctx, "second", validPassword) // taken 冲突两次后拿到 fresh
+	inv := env.newInvite(t, InviteOptions{})
+	u, err := svc.Register(ctx, "second", validPassword, inv.Code, env.reserve(t, inv.Code)) // taken 冲突两次后拿到 fresh
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
 	if u.ID != fresh {
 		t.Errorf("ID = %d, want %d", u.ID, fresh)
 	}
+	if got := env.repo.invite(inv.ID); got.UsedAt == nil || u.InviteCodeID == nil || *u.InviteCodeID != inv.ID {
+		t.Errorf("邀请码应被这次注册使用：%+v", got)
+	}
 }
 
 // 连续冲突达到上限后放弃，返回内部错误（不是业务错误）
 func TestService_Register_GiveUpAfterMaxAttempts(t *testing.T) {
-	repo := newFakeRepo()
+	env := newTestEnv()
 	ids := make([]int64, maxIDAttempts+1)
 	for i := range ids {
 		ids[i] = 1111111111
 	}
-	svc := NewService(repo, fakeTokens{}, fixedIDs(ids...))
+	svc := NewService(env.repo, fakeTokens{}, fixedIDs(ids...))
 
 	ctx := context.Background()
-	if _, err := svc.Register(ctx, "first", validPassword); err != nil {
+	first := env.newInvite(t, InviteOptions{}).Code
+	if _, err := svc.Register(ctx, "first", validPassword, first, env.reserve(t, first)); err != nil {
 		t.Fatalf("准备数据失败: %v", err)
 	}
-	_, err := svc.Register(ctx, "second", validPassword)
+	inv := env.newInvite(t, InviteOptions{})
+	_, err := svc.Register(ctx, "second", validPassword, inv.Code, env.reserve(t, inv.Code))
 	if err == nil {
 		t.Fatal("连续冲突应当失败")
 	}
-	if errors.Is(err, ErrInvalidUsername) || errors.Is(err, ErrInvalidPassword) {
+	if errors.Is(err, ErrInvalidUsername) || errors.Is(err, ErrInvalidPassword) || errors.Is(err, ErrReservationLost) {
 		t.Errorf("不应返回业务校验错误: %v", err)
+	}
+	if got := env.repo.invite(inv.ID); got.UsedAt != nil {
+		t.Errorf("注册失败不应使用邀请码：%+v", got)
 	}
 }
 
@@ -153,12 +172,10 @@ func TestRandomUserID(t *testing.T) {
 }
 
 func TestService_Login(t *testing.T) {
-	svc, _ := newTestService()
+	env := newTestEnv()
+	svc := env.svc
 	ctx := context.Background()
-	u, err := svc.Register(ctx, validUsername, validPassword)
-	if err != nil {
-		t.Fatalf("准备数据失败: %v", err)
-	}
+	u := env.registerActive(t, validUsername)
 
 	t.Run("登录成功", func(t *testing.T) {
 		res, err := svc.Login(ctx, u.ID, validPassword)
@@ -200,24 +217,22 @@ func TestService_Login(t *testing.T) {
 }
 
 func TestService_Login_IssueTokenFailed(t *testing.T) {
-	repo := newFakeRepo()
+	env := newTestEnv()
 	ctx := context.Background()
-	u, err := NewService(repo, fakeTokens{}, counterIDs()).Register(ctx, validUsername, validPassword)
-	if err != nil {
-		t.Fatalf("准备数据失败: %v", err)
-	}
+	u := env.registerActive(t, validUsername)
 
-	svc := NewService(repo, fakeTokens{err: errors.New("boom")}, counterIDs())
-	_, err = svc.Login(ctx, u.ID, validPassword)
+	svc := NewService(env.repo, fakeTokens{err: errors.New("boom")}, counterIDs())
+	_, err := svc.Login(ctx, u.ID, validPassword)
 	if err == nil || errors.Is(err, ErrInvalidCredentials) {
 		t.Errorf("err = %v, want 内部错误（不能伪装成密码错误）", err)
 	}
 }
 
 func TestService_GetByID(t *testing.T) {
-	svc, _ := newTestService()
+	env := newTestEnv()
+	svc := env.svc
 	ctx := context.Background()
-	u, _ := svc.Register(ctx, validUsername, validPassword)
+	u := env.register(t, validUsername)
 
 	got, err := svc.GetByID(ctx, u.ID)
 	if err != nil || got.ID != u.ID {
@@ -250,14 +265,12 @@ func TestParseUserID(t *testing.T) {
 }
 
 func TestService_SearchProfiles(t *testing.T) {
-	svc, _ := newTestService()
+	env := newTestEnv()
+	svc := env.svc
+	// 只有已通过审核的账号能被搜到（FR-22），这里注册后都批准
 	register := func(name string) int64 {
 		t.Helper()
-		u, err := svc.Register(context.Background(), name, validPassword)
-		if err != nil {
-			t.Fatalf("Register(%q): %v", name, err)
-		}
-		return u.ID
+		return env.registerActive(t, name).ID
 	}
 	sam1 := register("Sam")
 	sam2 := register("sam")
@@ -302,11 +315,9 @@ func TestService_SearchProfiles(t *testing.T) {
 }
 
 func TestService_GetProfiles(t *testing.T) {
-	svc, _ := newTestService()
-	u, err := svc.Register(context.Background(), validUsername, validPassword)
-	if err != nil {
-		t.Fatalf("Register: %v", err)
-	}
+	env := newTestEnv()
+	svc := env.svc
+	u := env.register(t, validUsername)
 	profiles, err := svc.GetProfiles(context.Background(), []int64{u.ID, 1999999999})
 	if err != nil {
 		t.Fatalf("GetProfiles: %v", err)
@@ -330,13 +341,10 @@ func (d *denyAfter) Allow(_ context.Context, key string) bool {
 // NFR-05：按目标账号限制登录尝试。成功、失败都计数，超出后连正确的密码也拒绝，且不再查库
 func TestService_Login_RateLimited(t *testing.T) {
 	ctx := context.Background()
-	repo := newFakeRepo()
 	lim := &denyAfter{n: 2}
-	svc := NewService(repo, fakeTokens{}, counterIDs(), WithLoginLimiter(lim))
-	u, err := svc.Register(ctx, validUsername, validPassword)
-	if err != nil {
-		t.Fatal(err)
-	}
+	env := newTestEnv(WithLoginLimiter(lim))
+	svc := env.svc
+	u := env.registerActive(t, validUsername)
 
 	if _, err := svc.Login(ctx, u.ID, "Wrong1234"); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("第 1 次：%v", err)

@@ -12,7 +12,7 @@ npm run lint
 ## 目录
 
 - `src/theme.ts` + `src/index.css`：深色极简主题（三层背景明度差、淡黄强调色、青 / 粉点缀，规范见根目录 CLAUDE.md）。antd 组件用 `theme.ts` 的 token，自定义布局用 `index.css` 的 `--liki-*` 变量，两边配色保持一致
-- `src/api/`：`client.ts` 封装 fetch，按业务 code 抛出 `ApiError`，遇到 10003 时清除登录状态；`auth.ts`、`friend.ts`、`message.ts`、`ws.ts` 是各模块的接口函数和类型（对应后端 resp 结构体）
+- `src/api/`：`client.ts` 封装 fetch，按业务 code 抛出 `ApiError`，遇到 10003 时清除登录状态；`auth.ts`、`friend.ts`、`message.ts`、`invite.ts`、`ws.ts` 是各模块的接口函数和类型（对应后端 resp 结构体）
 - `src/realtime/socket.ts`：全局唯一的 WebSocket 连接。先调 `/ws/ticket` 换一次性票据再建连；25 秒心跳；断线按 1s、2s、4s…最多 30s 退避重连，网络恢复时立即重连；`socket.on(type, fn)` 订阅推送，`socket.onOpen` 在每次（重）连上时通知各 store 补齐数据。由 `MainLayout` 启动，令牌变化时断开
 - `src/stores/`：Zustand 全局状态，令牌变化时都会自动清空
   - `auth.ts` 是令牌读写的唯一入口（localStorage 键 `liki.token`）；`session.ts` 的 `logout()` 是主动退出：清令牌 + 删本地缓存（令牌过期只清令牌）
@@ -24,6 +24,8 @@ npm run lint
 - `src/routes/guards.tsx`：`RequireAuth`（需要登录）、`GuestOnly`（仅限未登录）
 - `src/layouts/MainLayout.tsx`：登录后的主框架（左侧导航：聊天 / 好友 / 我的账号）
 - `src/pages/`：页面组件。`friends/` 下是好友页（列表、详情、新的朋友、添加好友弹窗，搜索结果可以直接"发消息"）；`ChatPage.tsx` 是聊天页（左侧会话列表，右侧对话：滚到顶部 / 底部自动加载，IntersectionObserver 检测消息是否真正被看到，"以下为新消息"分隔线、顶部"N 条新消息"横条、底部"回到最新"按钮；消息悬停"⋯"菜单的删除 / 多选、头部"⋯"菜单的清空聊天记录；非好友时的发送限制提示、"非好友"标记和"添加好友"入口）
+- `src/pages/InviteModal.tsx`：邀请注册弹窗（FR-23），只在 `user.canInvite` 时从账号菜单打开：生成邀请链接、复制、作废，查看每个邀请码的使用者（及其审核状态）和验证记录
+- `src/stores/inviteReservation.ts`：注册前邀请码的验证与冻结。验证通过拿到冻结令牌（存 sessionStorage），注册页开着时每 30 秒续期；站内离开立即解冻，刷新 / 关闭标签页用 sendBeacon 软释放（服务端保留 15 秒，刷新后续期即恢复）；卸载时推迟一个宏任务再解冻，避免 StrictMode 的"卸载再挂载"误解冻
 - `src/components/UserAvatar.tsx`：默认头像（首字母 + 按用户 ID 固定的底色）
 - `src/utils/`：校验规则、时间格式化
 
@@ -31,7 +33,7 @@ npm run lint
 
 | 路径 | 页面 |
 | --- | --- |
-| `/login`、`/register` | 登录、注册（已登录访问会跳回首页） |
+| `/login`、`/register` | 登录、注册（已登录访问会跳回首页）。注册分两步：先验证邀请码（`/register#invite=XXXXXX` 自动验证），通过后才显示注册表单；提交后账号待管理员审核，不自动登录 |
 | `/` | 重定向到 `/friends` |
 | `/friends` | 好友页，右侧为空状态 |
 | `/friends/requests` | 新的朋友：收到的申请、我发出的申请 |

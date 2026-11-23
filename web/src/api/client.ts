@@ -7,7 +7,15 @@ export const Code = {
   BadRequest: 10002, // 请求体无法解析，属于前端代码 bug
   Unauthorized: 10003, // 令牌缺失/无效/过期：清除令牌并跳转登录页
   TooManyRequests: 10004, // 请求太频繁被限流（HTTP 429），msg 可以直接展示，稍后重试即可
+  Forbidden: 10005, // 已登录但没有权限（如非管理员生成邀请码），HTTP 403
+  // 账号模块
   InvalidCredentials: 20001, // 登录失败：同为 HTTP 401，但不跳转
+  AccountPending: 20002, // 登录失败：密码正确，账号待审核（FR-22）
+  AccountRejected: 20003, // 登录失败：密码正确，注册未通过审核
+  InvalidInvite: 20004, // 验证邀请码失败：不存在、过期、已使用或已作废（FR-23）
+  InviteNotFound: 20005, // 邀请码不存在或不是自己生成的
+  InviteInUse: 20006, // 邀请码正被别人使用（对方验证通过后正在填写注册表单）
+  ReservationLost: 20007, // 邀请码的验证已失效（冻结到期、被作废）：回到验证邀请码那一步
   // 好友模块
   CannotAddSelf: 30001,
   AlreadyFriends: 30002,

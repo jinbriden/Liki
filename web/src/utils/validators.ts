@@ -26,3 +26,16 @@ export function isValidPassword(s: string): boolean {
 export function isValidUserId(s: string): boolean {
   return USER_ID_RE.test(s)
 }
+
+export const MSG_INVALID_INVITE_CODE = '邀请码为 6 位数字或英文字母'
+
+// 邀请码：6 位数字 + 大写字母。输入不区分大小写，提交前转成大写（后端同样会转）
+const INVITE_CODE_RE = /^[0-9A-Z]{6}$/
+
+export function normalizeInviteCode(s: string): string {
+  return s.trim().toUpperCase()
+}
+
+export function isValidInviteCode(s: string): boolean {
+  return INVITE_CODE_RE.test(normalizeInviteCode(s))
+}

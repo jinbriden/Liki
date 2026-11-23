@@ -20,18 +20,31 @@ const testJWTSecret = "test-secret-0123456789-abcdefghijklmnop"
 
 // newTestRouter 用真实的 JWTManager 和鉴权中间件、假的 repository，按 main.go 的方式组装路由
 func newTestRouter(t *testing.T) *gin.Engine {
+	r, _ := newTestRouterEnv(t)
+	return r
+}
+
+// newTestRouterEnv 同 newTestRouter，同时返回底层的 service，用来准备邀请码、审核账号
+func newTestRouterEnv(t *testing.T) (*gin.Engine, *testEnv) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	jwtMgr, err := auth.NewJWTManager(testJWTSecret, 72*time.Hour)
 	if err != nil {
 		t.Fatalf("NewJWTManager: %v", err)
 	}
-	h := NewHandler(NewService(newFakeRepo(), jwtMgr, counterIDs()))
+	repo := newTestRepo()
+	env := &testEnv{
+		repo:    repo,
+		svc:     NewService(repo, jwtMgr, counterIDs()),
+		invites: NewInviteService(repo, testAdminID, counterCodes()),
+		review:  NewReviewService(repo),
+	}
+	h := NewHandler(env.svc, env.invites)
 
 	r := gin.New()
 	api := r.Group("/api/v1")
 	h.RegisterRoutes(api, api.Group("", auth.Middleware(jwtMgr)))
-	return r
+	return r, env
 }
 
 func doRequest(r *gin.Engine, method, path, body, token string) *httptest.ResponseRecorder {
@@ -63,34 +76,52 @@ func decode[T any](t *testing.T, w *httptest.ResponseRecorder) (code int, msg st
 	return body.Code, body.Msg, body.Data
 }
 
-func mustRegister(t *testing.T, r *gin.Engine, username, password string) userResp {
+// registerBody 注册请求体：生成一个邀请码并验证（冻结），带上令牌
+func registerBody(t *testing.T, env *testEnv, username, password string) string {
 	t.Helper()
-	w := postJSON(r, "/api/v1/auth/register", fmt.Sprintf(`{"username":%q,"password":%q}`, username, password))
+	code := env.newInvite(t, InviteOptions{}).Code
+	return fmt.Sprintf(`{"username":%q,"password":%q,"inviteCode":%q,"reservationToken":%q}`,
+		username, password, code, env.reserve(t, code))
+}
+
+// mustRegister 用一个新生成的邀请码通过接口提交注册申请（账号为待审核）
+func mustRegister(t *testing.T, r *gin.Engine, env *testEnv, username, password string) registerResp {
+	t.Helper()
+	w := postJSON(r, "/api/v1/auth/register", registerBody(t, env, username, password))
 	if w.Code != http.StatusOK {
 		t.Fatalf("注册失败: %d %s", w.Code, w.Body.String())
 	}
-	_, _, u := decode[userResp](t, w)
+	_, _, u := decode[registerResp](t, w)
+	return u
+}
+
+// mustRegisterActive 注册并批准，得到一个能登录的账号
+func mustRegisterActive(t *testing.T, r *gin.Engine, env *testEnv, username, password string) registerResp {
+	t.Helper()
+	u := mustRegister(t, r, env, username, password)
+	if err := env.review.Approve(t.Context(), u.ID); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
 	return u
 }
 
 // ---------- 注册 ----------
 
-// 同名注册两次都成功，返回不同的 10 位 ID；用户名大小写原样返回；响应里不含密码相关字段
+// 同名注册两次都成功，返回不同的 10 位 ID；用户名大小写原样返回；账号为待审核；响应里不含密码相关字段
 func TestHandler_Register_OK(t *testing.T) {
-	r := newTestRouter(t)
-	body := `{"username":"Alice","password":"Passw0rd"}`
+	r, env := newTestRouterEnv(t)
 
 	var ids []int64
 	for range 2 {
-		w := postJSON(r, "/api/v1/auth/register", body)
+		w := postJSON(r, "/api/v1/auth/register", registerBody(t, env, "Alice", "Passw0rd"))
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200, body = %s", w.Code, w.Body.String())
 		}
 		if strings.Contains(strings.ToLower(w.Body.String()), "password") {
 			t.Fatalf("响应中不应出现 password 字段: %s", w.Body.String())
 		}
-		code, _, u := decode[userResp](t, w)
-		if code != response.CodeOk || u.Username != "Alice" || u.ID < minUserID || u.ID > maxUserID {
+		code, _, u := decode[registerResp](t, w)
+		if code != response.CodeOk || u.Username != "Alice" || u.ID < minUserID || u.ID > maxUserID || u.Status != StatusPending {
 			t.Fatalf("unexpected resp: %s", w.Body.String())
 		}
 		ids = append(ids, u.ID)
@@ -138,10 +169,10 @@ func TestHandler_Register_Errors(t *testing.T) {
 
 // ---------- 登录 + /me ----------
 
-// 完整流程：注册 → 登录拿令牌 → 带令牌访问 /me
+// 完整流程：注册 → 管理员批准 → 登录拿令牌 → 带令牌访问 /me
 func TestHandler_LoginThenMe(t *testing.T) {
-	r := newTestRouter(t)
-	reg := mustRegister(t, r, "Alice", "Passw0rd")
+	r, env := newTestRouterEnv(t)
+	reg := mustRegisterActive(t, r, env, "Alice", "Passw0rd")
 
 	w := postJSON(r, "/api/v1/auth/login", fmt.Sprintf(`{"userId":%d,"password":"Passw0rd"}`, reg.ID))
 	if w.Code != http.StatusOK {
@@ -166,6 +197,9 @@ func TestHandler_LoginThenMe(t *testing.T) {
 	if me.ID != reg.ID || me.Username != "Alice" {
 		t.Errorf("/me = %+v, want id=%d", me, reg.ID)
 	}
+	if me.CanInvite || login.User.CanInvite {
+		t.Errorf("普通账号 canInvite 应为 false")
+	}
 	// 注册返回的 createdAt 必须和之后查询到的完全一致（精度、时区都相同）
 	if !me.CreatedAt.Equal(reg.CreatedAt) {
 		t.Errorf("createdAt 不一致: 注册=%s, /me=%s", reg.CreatedAt, me.CreatedAt)
@@ -174,10 +208,13 @@ func TestHandler_LoginThenMe(t *testing.T) {
 
 // 接口里的时间统一以 UTC 输出（RFC 3339 末尾为 Z），不受服务器时区影响
 func TestHandler_TimesAreUTC(t *testing.T) {
-	r := newTestRouter(t)
-	w := postJSON(r, "/api/v1/auth/register", `{"username":"Alice","password":"Passw0rd"}`)
-	_, _, reg := decode[userResp](t, w)
+	r, env := newTestRouterEnv(t)
+	w := postJSON(r, "/api/v1/auth/register", registerBody(t, env, "Alice", "Passw0rd"))
+	_, _, reg := decode[registerResp](t, w)
 	assertUTCField(t, w.Body.String(), "createdAt")
+	if err := env.review.Approve(t.Context(), reg.ID); err != nil {
+		t.Fatal(err)
+	}
 
 	w = postJSON(r, "/api/v1/auth/login", fmt.Sprintf(`{"userId":%d,"password":"Passw0rd"}`, reg.ID))
 	assertUTCField(t, w.Body.String(), "expiresAt")
@@ -208,8 +245,13 @@ func assertUTCField(t *testing.T, body, field string) {
 }
 
 func TestHandler_Login_Errors(t *testing.T) {
-	r := newTestRouter(t)
-	reg := mustRegister(t, r, "Alice", "Passw0rd")
+	r, env := newTestRouterEnv(t)
+	reg := mustRegisterActive(t, r, env, "Alice", "Passw0rd")
+	pending := mustRegister(t, r, env, "Bob", "Passw0rd")
+	rejected := mustRegister(t, r, env, "Carol", "Passw0rd")
+	if err := env.review.Reject(t.Context(), rejected.ID); err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
 		name       string
@@ -228,6 +270,16 @@ func TestHandler_Login_Errors(t *testing.T) {
 			http.StatusBadRequest, response.CodeBadRequest, msgBadRequest},
 		{"JSON语法错误", `{bad`,
 			http.StatusBadRequest, response.CodeBadRequest, msgBadRequest},
+
+		// 审核状态只在密码正确时才透露（FR-22）
+		{"待审核", fmt.Sprintf(`{"userId":%d,"password":"Passw0rd"}`, pending.ID),
+			http.StatusForbidden, response.CodeAccountPending, msgAccountPending},
+		{"待审核但密码错误", fmt.Sprintf(`{"userId":%d,"password":"Wr0ngPass"}`, pending.ID),
+			http.StatusUnauthorized, response.CodeInvalidCredentials, msgInvalidCredentials},
+		{"已拒绝", fmt.Sprintf(`{"userId":%d,"password":"Passw0rd"}`, rejected.ID),
+			http.StatusForbidden, response.CodeAccountRejected, msgAccountRejected},
+		{"已拒绝但密码错误", fmt.Sprintf(`{"userId":%d,"password":"Wr0ngPass"}`, rejected.ID),
+			http.StatusUnauthorized, response.CodeInvalidCredentials, msgInvalidCredentials},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

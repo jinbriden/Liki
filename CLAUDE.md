@@ -8,6 +8,7 @@ Web 端即时通讯软件，个人学习项目（Go 后端 + React 前端 + Post
 - `docker-compose.yml`：本地 PostgreSQL，监听 127.0.0.1:5432，用户 / 密码 / 库名 = im / im123 / im
 - `im-server/`：Go 后端，模块名 `im-server`
   - `cmd/server/main.go`：程序入口，在这里手动组装依赖（repository → service → handler）
+  - `cmd/admin/main.go`：服务器上的管理命令行 `im-admin`（注册审核、邀请码），直接用 user 模块的 `ReviewService` / `InviteService`，不需要 JWT_SECRET
   - `internal/<模块>/`：user、friend、message 按 `model.go`、`repository.go`、`service.go`、`handler.go` 分层；需要实时推送的模块另有 `notify.go`（把 service 的 `Notifier` 接口实现为 WebSocket 推送）
   - `internal/gateway/`：WebSocket 网关，只做票据鉴权、连接管理、心跳、按 `type` 分发数据包和按用户推送（`Push`），不写业务逻辑；业务模块用 `Handle(type, fn)` 注册处理函数
   - `internal/pkg/response/`：统一响应格式 `{code, msg, data}` 和错误码常量（常量名以代码为准）
@@ -31,7 +32,7 @@ Web 端即时通讯软件，个人学习项目（Go 后端 + React 前端 + Post
 - handler 只负责 JSON 绑定和写响应；service 写业务逻辑；repository 只访问数据库。
 - 参数校验：handler 不写 `binding` 校验规则，业务规则（长度、字符集等）在 service 校验并返回哨兵错误（如 `ErrInvalidPassword`）。请求体无法解析 → `CodeBadRequest`(10002)；业务规则不满足 → `CodeInvalidParam`(10001)。
 - 数据库错误（如唯一约束冲突）在 repository 层翻译成业务哨兵错误，service 和 handler 不 import gorm。
-- GORM 已开启 `TranslateError: true`。
+- GORM 已开启 `TranslateError: true`，但它只对 Create / Update 等方法生效：手写 SQL（`Raw(...).Scan`）拿到的是原始的 `*pgconn.PgError`，需要判断唯一约束 / 外键冲突时先手动翻译（见 `user` 模块 repository 的 `translate`）。
 - 接口返回专门定义的 resp 结构体，不直接返回 model，避免泄露 `password_hash` 等字段。
 - 表结构变更只通过 `migrations/` 下的迁移文件，不使用 GORM AutoMigrate，不手动改表。
 - 服务开发阶段只监听 `127.0.0.1:8080`。
@@ -59,7 +60,16 @@ migrate -path migrations -database "postgres://im:im123@localhost:5432/im?sslmod
 # 生成一次后固定使用（例如写进 ~/.bashrc），每次换密钥会让已签发的令牌全部失效：
 #   openssl rand -base64 48
 export JWT_SECRET='<你的密钥>'
+# DATABASE_DSN 也必填，没有默认值（默认值里只能写开发库密码，线上漏配会悄悄用上）：
+export DATABASE_DSN="host=localhost user=im password=im123 dbname=im port=5432 sslmode=disable"
+# ADMIN_USER_ID 可选：管理员账号的用户 ID（必须已存在且已通过审核，否则拒绝启动）。不设置时没有人能生成邀请码，也就没人能注册
+# 可选：LISTEN_ADDR（默认 127.0.0.1:8080）、TRUSTED_PROXIES（逗号分隔，线上在 Nginx 后面设为 127.0.0.1）
 go run ./cmd/server
+# 管理命令行（读同样的 DATABASE_DSN、ADMIN_USER_ID；PUBLIC_BASE_URL 可选，用于打印邀请链接）
+go run ./cmd/admin help
+go run ./cmd/admin list                  # 待审核的账号（list rejected 看已拒绝的）
+go run ./cmd/admin approve <用户ID>       # reject <用户ID> 拒绝
+go run ./cmd/admin invite create -note 备注  # 还有 invite list | show <ID>（含验证记录）| revoke <ID>
 # 日志：控制台为 text，同时以 JSON 追加写入 logs/im-server.log（已被 .gitignore 忽略），按 request_id / conn_id 检索：
 #   jq 'select(.request_id=="<X-Request-ID 响应头>")' logs/im-server.log
 # 可选环境变量：LOG_LEVEL=debug|info|warn|error（默认 debug）、LOG_FORMAT=text|json、
@@ -119,6 +129,16 @@ npm run lint
     - 前端：消息悬停出现"⋯"菜单（多选 / 删除），多选模式下输入框换成"已选 N / 30"操作条，头部"⋯"菜单里有"清空聊天记录"，都要二次确认；发送中的不能删，发送失败 / 超长的只删本地。
   - 限流（NFR-05）：注册每 IP 每小时 10 次、登录每 IP 每分钟 20 次 + 每个目标账号每分钟 5 次、好友申请每用户每小时 30 次、换票据每用户每分钟 30 次、发消息每用户每秒 5 条（突发 10 条，去重命中的重发不计数）；超出返回 10004 / HTTP 429。前端被限流的消息标记为"发送太频繁，点击重试"，不自动重发。
   - 顺带修复：客户端在写请求途中断开时，数据库已提交但驱动报 context canceled，接口返回 500、提交后的推送被跳过（例如同意好友申请后申请方收不到通知）。用 `reqctx` 让写操作不随客户端断开而取消。
+- M7 审核与上线：进行中（迁移 000008；需求 FR-22、FR-23；错误码 10005、20002～20007）。
+  - 邀请码（FR-23）：6 位 0-9A-Z，明文存储（穷举空间小，哈希没有保护作用），一码一用（提交注册申请即失效，与审核结果无关；`users.invite_code_id` 部分唯一索引兜底），默认 3 天过期，`invite_codes.created_by` 溯源（命令行生成的也记在管理员名下）。
+  - 注册分两步：`POST /auth/invite/verify` 验证通过即**冻结**（租约 3 分钟，返回 128 位冻结令牌，库里存 SHA-256），注册页每 30 秒 `renew`，站内离开 `release` 立即解冻，刷新 / 关闭标签页（`pagehide`）用 sendBeacon 软释放（只保留 15 秒，刷新后续期即恢复），最长冻结 30 分钟；`POST /auth/register` 必须带令牌，事务里条件 UPDATE 写 `used_at` + 插入用户，ID 冲突重试时整体回滚。冻结不刷新有效期。
+  - 验证频率存在 `invite_verifications`（也是溯源记录：时间、IP、结果）：每 IP 24 小时 10 次（不论码是否有效，`pg_advisory_xact_lock` 让同一 IP 的验证串行）、每码 1 分钟 1 次 / 24 小时 10 次（只数成功的）。`ReserveInvite` 对业务失败也提交事务（失败的尝试要计数），结果通过外层变量带出。
+  - 审核（FR-22）：`users.status` pending / active / rejected，迁移前的账号为 active、之后默认 pending。登录在密码校验通过后才判断状态（20002 / 20003，HTTP 403）；搜索只返回 active。审核只在命令行（`ReviewService`），已通过的不能改成拒绝。
+  - 权限：`InviteService.CanInvite` 判断谁能生成邀请码（现在 = `ADMIN_USER_ID`），`/me` 和登录返回 `canInvite`，前端据此在账号菜单显示"邀请注册"；生成邀请码每用户每小时 20 次。
+  - 前端：`src/stores/inviteReservation.ts` 管冻结的生命周期（续期定时器、离开时解冻、sessionStorage 恢复、StrictMode 下"卸载再挂载"不误解冻）；注册页先显示邀请码输入（`/register#invite=XXXXXX` 自动验证后从地址栏去掉），冻结后才显示注册表单，提交成功显示用户 ID 和"等待审核"、不自动登录；`src/pages/InviteModal.tsx` 生成、复制链接、作废，查看使用者和验证记录。
+  - 生产配置：`DATABASE_DSN` 必填、`LISTEN_ADDR`、`TRUSTED_PROXIES`（线上必须设，否则所有人共用 127.0.0.1 的验证次数）、`ADMIN_USER_ID`。
+  - 已用 `im_test` 起真实服务验证了验证 / 续期 / text/plain 软释放 / 每码频率；浏览器里的注册流程还没测（要调注册接口，先问用户）。
+  - 待做：Nginx / systemd / 备份 / logrotate 配置和 `docs/deploy.md`。
 - 待办：连接建立后令牌过期不会主动断开 WebSocket（重连时换票据会失败，届时跳转登录）；个人资料页（requirements.md 第 8 节未定）。
 
 ## 协作方式
